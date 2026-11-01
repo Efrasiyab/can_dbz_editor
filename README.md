@@ -2,6 +2,8 @@
 
 A Zig terminal UI (TUI) CAN database viewer/editor.
 
+> **Warning:** This project is under active development and is not ready for any type of use. Do not rely on it to edit, validate, or export CAN databases.
+
 - Parsing/export is powered by [`can_dbz`](https://github.com/Efrasiyab/can_dbz).
 - Terminal rendering and input are powered by [`zigzag`](https://github.com/Efrasiyab/zigzag).
 - The canonical on-disk format for saves is **CAN JSON v1** (`.can.json`).
