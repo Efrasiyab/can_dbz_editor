@@ -1,0 +1,55 @@
+{
+  "name": "can_dbz_editor",
+  "build": {
+    "dockerfile": "../Containerfile",
+    "context": ".."
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "username": "vscode",
+      "installZsh": false,
+      "upgradePackages": false
+    }
+  },
+  "remoteUser": "vscode",
+  "containerEnv": {
+    "ZIG_GLOBAL_CACHE_DIR": "/home/vscode/.cache/zig"
+  },
+  "mounts": [
+    "source=can_dbz-zig-cache,target=/home/vscode/.cache/zig,type=volume"
+  ],
+  "postCreateCommand": "mkdir -p /home/vscode/.cache/zig && sudo chown -R vscode:vscode /home/vscode/.cache/zig && zig version",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "OpenAI.chatgpt",
+        "ms-azuretools.vscode-containers",
+        "ziglang.vscode-zig",
+        "vadimcn.vscode-lldb",
+        "editorconfig.editorconfig",
+        "eamodio.gitlens",
+        "streetsidesoftware.code-spell-checker",
+        "yzhang.markdown-all-in-one",
+        "davidanson.vscode-markdownlint",
+        "bierner.markdown-mermaid",
+        "lharri73.dbc"
+      ],
+      "settings": {
+        "zig.path": "zig",
+        "zig.zls.enabled": "on",
+        "zig.formattingProvider": "zls",
+        "editor.formatOnSave": true,
+        "[zig]": {
+          "editor.defaultFormatter": "ziglang.vscode-zig"
+        },
+        "[markdown]": {
+          "editor.defaultFormatter": "yzhang.markdown-all-in-one",
+          "editor.wordWrap": "on"
+        },
+        "files.associations": {
+          "*.zon": "zig"
+        }
+      }
+    }
+  }
+}
