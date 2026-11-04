@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .can_dbz = .{
-            .url = "git+https://github.com/Efrasiyab/can_dbz#625322f5407572f72a6f6b7d43af1c512076c90d",
-            .hash = "can_dbz-0.0.0-HlV0ihdsBQD-TM6DJO8ZYYP-hs0sodkSqyqfxI2m9q07",
+            .url = "git+https://github.com/Efrasiyab/can_dbz#27209744c12999ca8f9ecccd7bcd81594cf72bf2",
+            .hash = "can_dbz-0.0.0-HlV0immJBQBjGns5Ckz7hkjTXj2HjKEBnABREU7VKuKM",
         },
         .zigzag = .{
             .url = "git+https://github.com/Efrasiyab/zigzag#15db0f7e12dd6840307c3062c9c5c4fa851c79d0",
