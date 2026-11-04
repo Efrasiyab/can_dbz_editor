@@ -12,11 +12,13 @@ const payload = @import("domain/payload.zig");
 const App = app_mod.App;
 const Action = keymap_mod.Action;
 const Alloc = std.mem.Allocator;
+const MuxDropdownValue = union(enum) { all, value: i128, custom };
+const MuxDropdown = zz.components.Dropdown(MuxDropdownValue);
 
-const RowKind = enum { category, bus, message, signal, node, table, attr, meta };
-const Tab = enum { messages, nodes, tables, attributes, metadata };
-const tab_titles = [_][]const u8{ "Messages", "Nodes", "Value tables", "Attributes", "Metadata" };
-const meta_labels = [_][]const u8{ "document name", "description", "dbc version", "extensions" };
+const RowKind = enum { category, bus, message, signal, node, table, env_var, attr, meta };
+const Tab = enum { messages, nodes, tables, environment_variables, attributes, metadata };
+const tab_titles = [_][]const u8{ "Messages", "Nodes", "Value tables", "Environment variables", "Attributes", "Metadata" };
+const meta_labels = [_][]const u8{ "document name", "description", "dbc version", "extensions", "document attributes" };
 const Row = struct {
     kind: RowKind,
     bus: usize,
@@ -31,7 +33,7 @@ const Row = struct {
     fn same(a: Row, b: Row) bool {
         return a.kind == b.kind and a.msg == b.msg and a.sig == b.sig and (a.kind != .bus or a.bus == b.bus) and
             (a.kind != .node or a.node == b.node) and (a.kind != .table or a.table == b.table) and
-            (a.kind != .attr and a.kind != .meta or a.idx == b.idx) and (a.kind != .category or a.cat == b.cat);
+            (a.kind != .env_var and a.kind != .attr and a.kind != .meta or a.idx == b.idx) and (a.kind != .category or a.cat == b.cat);
     }
 };
 
@@ -59,6 +61,7 @@ const menus = [_]Menu{
         .{ .label = "Undo", .action = .undo },
         .{ .label = "Redo", .action = .redo },
         .{ .label = "New item", .action = .add },
+        .{ .label = "Add bus...", .action = .add_bus },
         .{ .label = "Duplicate", .action = .duplicate },
         .{ .label = "Delete", .action = .delete },
         .{ .label = "Move or resize signal", .action = .move_signal },
@@ -84,10 +87,10 @@ const menus = [_]Menu{
         .{ .label = "Keys and commands", .action = .help },
     } },
 };
-const Purpose = enum { open, save_as, export_dbc, search, command, add_bus, add_message, add_signal, add_node, add_table, rename, edit_field, new_path, new_type };
+const Purpose = enum { open, save_as, export_bus, export_dbc, mux_value, search, command, add_bus, add_message, add_signal, add_node, add_table, add_environment_variable, add_attribute_definition, rename, edit_field, new_path, new_type };
 const ConfirmKind = enum { quit, delete, open, create, overwrite, new };
 
-const FieldTag = union(enum) { m: ops.MessageField, s: ops.SignalField, n: ops.NodeField, t: ops.TableField, ro };
+const FieldTag = union(enum) { b: ops.BusField, m: ops.MessageField, s: ops.SignalField, n: ops.NodeField, t: ops.TableField, ev: ops.EnvironmentVariableField, ad: ops.AttributeDefinitionField, md: ops.MetadataField, aa: usize, ro };
 const FieldKind = enum { text, cycle, readonly };
 const Group = enum { definition, conversion, choices, multiplexing, metadata };
 const group_titles = [_][]const u8{ "Definition", "Conversion", "Choices", "Multiplexing", "Metadata" };
@@ -102,6 +105,9 @@ const bool_opts = [_][]const u8{ "false", "true" };
 const frame_opts = enumNames(can_dbz.model.FrameKind);
 const order_opts = enumNames(can_dbz.model.ByteOrder);
 const type_opts = enumNames(can_dbz.model.SignalType);
+const env_type_opts = enumNames(can_dbz.model.EnvironmentVariableType);
+const attr_scope_opts = enumNames(can_dbz.model.AttributeScope);
+const attr_type_opts = enumNames(can_dbz.model.AttributeType);
 
 const Field = struct {
     label: []const u8,
@@ -119,6 +125,7 @@ const Draft = struct { idx: usize, text: []u8, err: ?[]u8 };
 const VField = struct { idx: usize, f: Field };
 
 const SelStyle = enum { none, sel, dim };
+const MuxFilterState = struct { bus: []u8, message: []u8, selector: []u8, value: ?i128 = null, custom: bool = false };
 
 const signal_fg = [_][]const u8{ "\x1b[1;91m", "\x1b[1;92m", "\x1b[1;93m", "\x1b[1;94m", "\x1b[1;95m", "\x1b[1;96m", "\x1b[1;31m", "\x1b[1;32m" };
 const signal_selected_bg = [_][]const u8{ "\x1b[30;101;1m", "\x1b[30;102;1m", "\x1b[30;103;1m", "\x1b[97;44;1m", "\x1b[30;105;1m", "\x1b[30;106;1m", "\x1b[97;41;1m", "\x1b[97;42;1m" };
@@ -142,6 +149,9 @@ pub const Model = struct {
     sel_sig: usize = 0,
     /// Absolute payload bit under the map cursor.
     map_bit: u32 = 0,
+    mux_selector_index: usize = 0,
+    mux_filters: std.ArrayListUnmanaged(MuxFilterState) = .empty,
+    mux_dropdown: ?MuxDropdown = null,
     focus: Focus = .tree,
     field_cursor: usize = 0,
     diag_cursor: usize = 0,
@@ -152,6 +162,7 @@ pub const Model = struct {
     input_purpose: Purpose = .command,
     input_label: []const u8 = "",
     input_row: Row = .{ .kind = .bus, .bus = 0 },
+    export_bus_index: ?usize = null,
     input_tag: FieldTag = .ro,
     /// Start bit for a signal created from the map; cleared after use.
     anchor_bit: ?u32 = null,
@@ -221,6 +232,7 @@ pub const Model = struct {
     pub fn deinit(self: *Model) void {
         self.rows.deinit(self.app.gpa);
         self.clearDrafts();
+        self.closeMuxDropdown();
         self.drafts.deinit(self.app.gpa);
         self.edit_buf.deinit(self.app.gpa);
         self.palette_buf.deinit(self.app.gpa);
@@ -229,6 +241,12 @@ pub const Model = struct {
         self.input_buf.deinit(self.app.gpa);
         self.payload_buf.deinit(self.app.gpa);
         const gpa = self.app.gpa;
+        for (self.mux_filters.items) |filter| {
+            gpa.free(filter.bus);
+            gpa.free(filter.message);
+            gpa.free(filter.selector);
+        }
+        self.mux_filters.deinit(gpa);
         if (self.confirm_text) |s| gpa.free(s);
         if (self.confirm_path) |s| gpa.free(s);
         if (self.status) |s| gpa.free(s);
@@ -276,6 +294,7 @@ pub const Model = struct {
             .messages => doc.messages.items.len,
             .nodes => doc.nodes.items.len,
             .tables => doc.value_tables.items.len,
+            .environment_variables => doc.environment_variables.items.len,
             .attributes => doc.attribute_definitions.items.len,
             .metadata => meta_labels.len,
         };
@@ -303,6 +322,9 @@ pub const Model = struct {
                 },
                 .tables => for (doc.value_tables.items, 0..) |t, ti| {
                     if (self.nameMatches(t.name)) try self.rows.append(gpa, .{ .kind = .table, .bus = 0, .table = ti });
+                },
+                .environment_variables => for (doc.environment_variables.items, 0..) |variable, vi| {
+                    if (self.nameMatches(variable.name)) try self.rows.append(gpa, .{ .kind = .env_var, .bus = 0, .idx = vi });
                 },
                 .attributes => for (doc.attribute_definitions.items, 0..) |d, ai| {
                     if (self.nameMatches(d.name)) try self.rows.append(gpa, .{ .kind = .attr, .bus = 0, .idx = ai });
@@ -488,7 +510,8 @@ pub const Model = struct {
 
     fn attrValueText(a: Alloc, v: can_dbz.model.AttributeValue) ![]const u8 {
         return switch (v) {
-            .integer, .hex, .float, .string => |s| s,
+            .integer, .hex, .float => |s| s,
+            .string => |s| if (s.len == 0) "\"\"" else s,
             .enum_index => |i| std.fmt.allocPrint(a, "{d}", .{i}),
         };
     }
@@ -503,26 +526,59 @@ pub const Model = struct {
             },
             .attr => {
                 const d = doc.attribute_definitions.items[row.idx];
-                try list.append(a, .{ .label = "name", .value = d.name });
-                try list.append(a, .{ .label = "scope", .value = @tagName(d.scope) });
-                try list.append(a, .{ .label = "type", .value = @tagName(d.value_type) });
-                try list.append(a, .{ .label = "minimum", .value = d.minimum orelse "" });
-                try list.append(a, .{ .label = "maximum", .value = d.maximum orelse "" });
-                try list.append(a, .{ .label = "default", .value = if (d.default) |v| try attrValueText(a, v) else "" });
+                inline for (comptime std.meta.fieldNames(ops.AttributeDefinitionField), 0..) |fname, fi| {
+                    const tag: ops.AttributeDefinitionField = @fromBackingInt(@intCast(fi));
+                    var fld: Field = .{ .label = fname, .value = "", .tag = .{ .ad = tag }, .kind = .text };
+                    switch (tag) {
+                        .name => fld.value = d.name,
+                        .scope => {
+                            fld.value = @tagName(d.scope);
+                            fld.kind = .cycle;
+                            fld.next = nextOf(can_dbz.model.AttributeScope, d.scope);
+                            fld.options = &attr_scope_opts;
+                        },
+                        .value_type => {
+                            fld.label = "type";
+                            fld.value = @tagName(d.value_type);
+                            fld.kind = .cycle;
+                            fld.next = nextOf(can_dbz.model.AttributeType, d.value_type);
+                            fld.options = &attr_type_opts;
+                        },
+                        .minimum => fld.value = d.minimum orelse "",
+                        .maximum => fld.value = d.maximum orelse "",
+                        .enum_labels => {
+                            fld.label = "enum labels (| separated)";
+                            fld.value = try std.mem.join(a, " | ", d.enum_labels.items);
+                        },
+                        .default => fld.value = if (d.default) |v| try attrValueText(a, v) else "",
+                    }
+                    try list.append(a, fld);
+                }
             },
             .meta => {
-                const value: []const u8 = switch (row.idx) {
-                    0 => doc.name orelse "",
-                    1 => doc.description orelse "",
-                    2 => blk: {
-                        const meta = doc.dbc orelse break :blk "";
-                        if (meta != .object) break :blk "";
-                        const v = meta.object.get("version") orelse break :blk "";
-                        break :blk if (v == .string) v.string else "";
-                    },
-                    else => if (doc.extensions != null) "present" else "none",
+                if (row.idx == 4) {
+                    try list.append(a, .{ .label = "scope", .value = "document" });
+                    try self.appendAssignmentFields(a, &list, row, .document);
+                    return list.items;
+                }
+                const tag: ops.MetadataField = switch (row.idx) {
+                    0 => .document_name,
+                    1 => .description,
+                    2 => .dbc_version,
+                    else => .extensions,
                 };
-                try list.append(a, .{ .label = meta_labels[row.idx], .value = value });
+                const value: []const u8 = switch (tag) {
+                    .document_name => doc.name orelse "",
+                    .description => doc.description orelse "",
+                    .dbc_version => blk: {
+                        const metadata = doc.dbc orelse break :blk "";
+                        if (metadata != .object) break :blk "";
+                        const version = metadata.object.get("version") orelse break :blk "";
+                        break :blk if (version == .string) version.string else "";
+                    },
+                    .extensions => if (doc.extensions) |extensions| try std.json.Stringify.valueAlloc(a, extensions, .{}) else "",
+                };
+                try list.append(a, .{ .label = meta_labels[row.idx], .value = value, .tag = .{ .md = tag }, .kind = .text });
             },
             .table => {
                 const t = doc.value_tables.items[row.table];
@@ -533,13 +589,59 @@ pub const Model = struct {
                 const n = doc.nodes.items[row.node];
                 try list.append(a, .{ .label = "name", .value = n.name, .tag = .{ .n = .name }, .kind = .text });
                 try list.append(a, .{ .label = "description", .value = n.description orelse "", .tag = .{ .n = .description }, .kind = .text });
+                try self.appendAssignmentFields(a, &list, row, .node);
+            },
+            .env_var => {
+                const variable = doc.environment_variables.items[row.idx];
+                inline for (comptime std.meta.fieldNames(ops.EnvironmentVariableField), 0..) |fname, fi| {
+                    const tag: ops.EnvironmentVariableField = @fromBackingInt(@intCast(fi));
+                    var fld: Field = .{ .label = fname, .value = "", .tag = .{ .ev = tag }, .kind = .text };
+                    switch (tag) {
+                        .name => fld.value = variable.name,
+                        .variable_type => {
+                            fld.label = "type";
+                            fld.value = @tagName(variable.variable_type);
+                            fld.kind = .cycle;
+                            fld.next = nextOf(can_dbz.model.EnvironmentVariableType, variable.variable_type);
+                            fld.options = &env_type_opts;
+                        },
+                        .minimum => fld.value = variable.minimum,
+                        .maximum => fld.value = variable.maximum,
+                        .unit => fld.value = variable.unit,
+                        .initial_value => fld.value = variable.initial_value,
+                        .ev_id => fld.value = try std.fmt.allocPrint(a, "{d}", .{variable.ev_id}),
+                        .access_type => fld.value = try std.fmt.allocPrint(a, "{d}", .{variable.access_type}),
+                        .access_nodes => fld.value = try joined(a, variable.access_nodes.items),
+                        .data_size => fld.value = try optNum(a, variable.data_size),
+                        .description => {
+                            fld.label = "description";
+                            fld.value = variable.description orelse "";
+                            fld.group = .metadata;
+                        },
+                    }
+                    if (tag == .access_nodes or tag == .data_size) fld.group = .metadata;
+                    try list.append(a, fld);
+                }
+                try self.appendAssignmentFields(a, &list, row, .environment_variable);
             },
             .bus => {
                 const b = doc.buses.items[row.bus];
-                try list.append(a, .{ .label = "name", .value = b.name });
-                try list.append(a, .{ .label = "nominal_bitrate", .value = try optNum(a, b.nominal_bitrate) });
-                try list.append(a, .{ .label = "data_bitrate", .value = try optNum(a, b.data_bitrate) });
-                try list.append(a, .{ .label = "protocol", .value = b.protocol orelse "" });
+                inline for (comptime std.meta.fieldNames(ops.BusField), 0..) |fname, fi| {
+                    const tag: ops.BusField = @fromBackingInt(@intCast(fi));
+                    var fld: Field = .{ .label = fname, .value = "", .tag = .{ .b = tag }, .kind = .text };
+                    switch (tag) {
+                        .name => fld.value = b.name,
+                        .nominal_bitrate => fld.value = try optNum(a, b.nominal_bitrate),
+                        .data_bitrate => fld.value = try optNum(a, b.data_bitrate),
+                        .protocol => fld.value = b.protocol orelse "",
+                        .description => {
+                            fld.value = b.description orelse "";
+                            fld.group = .metadata;
+                        },
+                    }
+                    try list.append(a, fld);
+                }
+                try self.appendAssignmentFields(a, &list, row, .bus);
             },
             .message => {
                 const m = doc.messages.items[row.msg];
@@ -568,6 +670,7 @@ pub const Model = struct {
                     try list.append(a, fld);
                 }
                 try list.append(a, .{ .label = "signals", .value = try std.fmt.allocPrint(a, "{d}", .{m.signals.items.len}) });
+                try self.appendAssignmentFields(a, &list, row, .message);
             },
             .signal => {
                 const s = doc.messages.items[row.msg].signals.items[row.sig];
@@ -610,6 +713,7 @@ pub const Model = struct {
                     }
                     try list.append(a, fld);
                 }
+                try self.appendAssignmentFields(a, &list, row, .signal);
             },
         }
         return list.items;
@@ -620,20 +724,31 @@ pub const Model = struct {
     }
 
     fn fieldCount(self: *const Model, row: Row) usize {
-        _ = self;
         return switch (row.kind) {
-            .bus => 4,
-            .message => std.meta.fieldNames(ops.MessageField).len + 1,
-            .signal => std.meta.fieldNames(ops.SignalField).len + 1,
-            .node, .table, .category, .meta => 2,
-            .attr => 6,
+            .bus => std.meta.fieldNames(ops.BusField).len + self.attributeDefinitionCount(.bus),
+            .message => std.meta.fieldNames(ops.MessageField).len + 1 + self.attributeDefinitionCount(.message),
+            .signal => std.meta.fieldNames(ops.SignalField).len + 1 + self.attributeDefinitionCount(.signal),
+            .node => 2 + self.attributeDefinitionCount(.node),
+            .table, .category => 2,
+            .env_var => std.meta.fieldNames(ops.EnvironmentVariableField).len + self.attributeDefinitionCount(.environment_variable),
+            .attr => std.meta.fieldNames(ops.AttributeDefinitionField).len,
+            .meta => if (row.idx == 4) 1 + self.attributeDefinitionCount(.document) else 1,
         };
+    }
+
+    fn attributeDefinitionCount(self: *const Model, scope: can_dbz.model.AttributeScope) usize {
+        var count: usize = 0;
+        for (self.app.doc.attribute_definitions.items) |definition| {
+            if (definition.scope == scope) count += 1;
+        }
+        return count;
     }
 
     // ---- inspector form ---------------------------------------------------
 
     fn groupOf(f: Field) Group {
         switch (f.tag) {
+            .b => |t| return if (t == .description) .metadata else .definition,
             .s => |t| return switch (t) {
                 .signal_type, .factor, .offset, .minimum, .maximum, .unit => .conversion,
                 .choices, .value_table => .choices,
@@ -646,6 +761,10 @@ pub const Model = struct {
             .m => |t| return if (t == .description) .metadata else .definition,
             .n => |t| return if (t == .description) .metadata else .definition,
             .t => |t| return if (t == .choices) .choices else .definition,
+            .ev => |t| return if (t == .description or t == .access_nodes or t == .data_size) .metadata else .definition,
+            .ad => return .definition,
+            .md => return .metadata,
+            .aa => return .metadata,
             .ro => return if (std.mem.eql(u8, f.label, "mux conditions")) .multiplexing else .definition,
         }
     }
@@ -664,6 +783,12 @@ pub const Model = struct {
                     .byte_order => &order_opts,
                     .signal_type => &type_opts,
                     .is_multiplexer => &bool_opts,
+                    else => &.{},
+                },
+                .ev => |t| if (t == .variable_type) &env_type_opts else &.{},
+                .ad => |t| switch (t) {
+                    .scope => &attr_scope_opts,
+                    .value_type => &attr_type_opts,
                     else => &.{},
                 },
                 else => &.{},
@@ -728,12 +853,59 @@ pub const Model = struct {
 
     fn applyOne(self: *Model, row: Row, tag: FieldTag, text: []const u8) ops.Error!void {
         return switch (tag) {
+            .b => |f| ops.setBusField(&self.app.doc, row.bus, f, text),
             .m => |f| ops.setMessageField(&self.app.doc, row.msg, f, text),
             .s => |f| ops.setSignalField(&self.app.doc, row.msg, row.sig, f, text),
             .n => |f| ops.setNodeField(&self.app.doc, row.node, f, text),
             .t => |f| ops.setTableField(&self.app.doc, row.table, f, text),
+            .ev => |f| ops.setEnvironmentVariableField(&self.app.doc, row.idx, f, text),
+            .ad => |f| ops.setAttributeDefinitionField(&self.app.doc, row.idx, f, text),
+            .md => |f| ops.setMetadataField(&self.app.doc, f, text),
+            .aa => |definition_index| blk: {
+                const assignments = assignmentList(&self.app.doc, row) orelse break :blk error.InvalidValue;
+                break :blk ops.setAttributeAssignment(&self.app.doc, assignments, definition_index, text);
+            },
             .ro => {},
         };
+    }
+
+    fn assignmentList(doc: *can_dbz.model.Document, row: Row) ?*std.ArrayListUnmanaged(can_dbz.model.AttributeAssignment) {
+        return switch (row.kind) {
+            .bus => &doc.buses.items[row.bus].attributes,
+            .node => &doc.nodes.items[row.node].attributes,
+            .message => &doc.messages.items[row.msg].attributes,
+            .signal => &doc.messages.items[row.msg].signals.items[row.sig].attributes,
+            .env_var => &doc.environment_variables.items[row.idx].attributes,
+            .meta => if (row.idx == 4) &doc.attributes else null,
+            else => null,
+        };
+    }
+
+    fn assignmentListConst(doc: *const can_dbz.model.Document, row: Row) []const can_dbz.model.AttributeAssignment {
+        return switch (row.kind) {
+            .bus => doc.buses.items[row.bus].attributes.items,
+            .node => doc.nodes.items[row.node].attributes.items,
+            .message => doc.messages.items[row.msg].attributes.items,
+            .signal => doc.messages.items[row.msg].signals.items[row.sig].attributes.items,
+            .env_var => doc.environment_variables.items[row.idx].attributes.items,
+            .meta => if (row.idx == 4) doc.attributes.items else &.{},
+            else => &.{},
+        };
+    }
+
+    fn appendAssignmentFields(self: *const Model, a: Alloc, fields: *std.ArrayListUnmanaged(Field), row: Row, scope: can_dbz.model.AttributeScope) !void {
+        const doc = &self.app.doc;
+        const assignments = assignmentListConst(doc, row);
+        for (doc.attribute_definitions.items, 0..) |definition, definition_index| {
+            if (definition.scope != scope) continue;
+            var value: []const u8 = "";
+            for (assignments) |assignment| {
+                if (!std.mem.eql(u8, assignment.name, definition.name)) continue;
+                value = try attrValueText(a, assignment.value);
+                break;
+            }
+            try fields.append(a, .{ .label = definition.name, .value = value, .tag = .{ .aa = definition_index }, .kind = .text, .group = .metadata });
+        }
     }
 
     /// Applies the edit to a scratch copy of the document and reports why it would be refused, if it would.
@@ -974,13 +1146,7 @@ pub const Model = struct {
         defer arena.deinit();
         const before = try self.check(arena.allocator());
         try self.app.beginEdit();
-        const r: ops.Error!void = switch (tag) {
-            .m => |f| ops.setMessageField(&self.app.doc, row.msg, f, text),
-            .s => |f| ops.setSignalField(&self.app.doc, row.msg, row.sig, f, text),
-            .n => |f| ops.setNodeField(&self.app.doc, row.node, f, text),
-            .t => |f| ops.setTableField(&self.app.doc, row.table, f, text),
-            .ro => {},
-        };
+        const r = self.applyOne(row, tag, text);
         r catch |e| {
             try self.app.abortEdit();
             try self.setStatus("Error: {s}", .{errText(e)});
@@ -1031,6 +1197,14 @@ pub const Model = struct {
                     const ti = ops.addValueTable(doc, name) catch |e| break :blk e;
                     target = .{ .kind = .table, .bus = 0, .table = ti };
                 },
+                .add_environment_variable => {
+                    const vi = ops.addEnvironmentVariable(doc, name) catch |e| break :blk e;
+                    target = .{ .kind = .env_var, .bus = 0, .idx = vi };
+                },
+                .add_attribute_definition => {
+                    const ai = ops.addAttributeDefinition(doc, name) catch |e| break :blk e;
+                    target = .{ .kind = .attr, .bus = 0, .idx = ai };
+                },
                 else => unreachable,
             }
         };
@@ -1043,6 +1217,8 @@ pub const Model = struct {
         self.tab = switch (target.?.kind) {
             .node => .nodes,
             .table => .tables,
+            .env_var => .environment_variables,
+            .attr => .attributes,
             else => .messages,
         };
         try self.rebuildRows();
@@ -1061,7 +1237,7 @@ pub const Model = struct {
     fn doDelete(self: *Model, row: Row) !void {
         try self.app.beginEdit();
         switch (row.kind) {
-            .bus, .category, .attr, .meta => unreachable,
+            .bus, .category, .meta => unreachable,
             .message => {
                 ops.deleteMessage(&self.app.doc, row.msg);
                 self.sel_sig = 0;
@@ -1069,6 +1245,8 @@ pub const Model = struct {
             .signal => ops.deleteSignal(&self.app.doc, row.msg, row.sig),
             .node => ops.deleteNode(&self.app.doc, row.node),
             .table => ops.deleteValueTable(&self.app.doc, row.table),
+            .env_var => ops.deleteEnvironmentVariable(&self.app.doc, row.idx),
+            .attr => ops.deleteAttributeDefinition(&self.app.doc, row.idx),
         }
         self.app.endEdit();
         try self.rebuildRows();
@@ -1172,6 +1350,8 @@ pub const Model = struct {
         filter,
         browser_row: usize,
         ws_tab: WsTab,
+        mux_filter: struct { selector_index: usize, edit_value: bool },
+        mux_dropdown_item: usize,
         msg_header,
         map_cell: u32,
         table_row: usize,
@@ -1227,7 +1407,7 @@ pub const Model = struct {
             const inner_h = main_h - 2;
             return switch (s.kind) {
                 .browser => try self.hitBrowser(a, inner_w, inner_y, inner_h),
-                .workspace => self.hitWorkspace(lx, inner_y, inner_w, inner_h, lay.stacked and lay.n > 1),
+                .workspace => try self.hitWorkspace(a, lx, inner_y, inner_w, inner_h, lay.stacked and lay.n > 1),
                 .inspector => try self.hitInspector(a, lx, inner_y, inner_w, inner_h),
             };
         }
@@ -1271,7 +1451,26 @@ pub const Model = struct {
         return .{ .region = .tree };
     }
 
-    fn hitWorkspace(self: *const Model, lx: usize, ry: usize, w: usize, h: usize, both: bool) Hit {
+    fn muxFilterHit(self: *const Model, a: Alloc, msg: *const can_dbz.model.Message, x: usize) !?Hit {
+        const active_selector = self.mux_selector_index % muxSelectorCount(msg);
+        var offset: usize = "Mux filters: ".len;
+        var selector_index: usize = 0;
+        for (msg.signals.items) |signal| {
+            if (!signal.is_multiplexer) continue;
+            const marker_len: usize = if (selector_index == active_selector) 1 else 0;
+            const value = try self.muxValueLabel(a, msg, &signal);
+            const segment = try std.fmt.allocPrint(a, "{s}{s} [{s} v]", .{ if (marker_len == 1) ">" else "", signal.name, value });
+            if (x >= offset and x < offset + segment.len) {
+                const value_start = offset + marker_len + signal.name.len + 2;
+                return .{ .mux_filter = .{ .selector_index = selector_index, .edit_value = x >= value_start } };
+            }
+            offset += segment.len + 3;
+            selector_index += 1;
+        }
+        return null;
+    }
+
+    fn hitWorkspace(self: *const Model, a: Alloc, lx: usize, ry: usize, w: usize, h: usize, both: bool) !Hit {
         const msg = self.curMsg() orelse return .none;
         if (ry == 0) {
             var cx: usize = 0;
@@ -1302,11 +1501,24 @@ pub const Model = struct {
         }
         if (wm.table_h > 0 and ry >= wm.table_y and ry < wm.table_y + wm.table_h) {
             const rel = ry - wm.table_y;
-            if (rel == 0) return .{ .region = .table };
-            const avail = wm.table_h - 1;
+            const filter_rows: usize = if (muxSelectorCount(msg) > 0) 1 else 0;
+            if (filter_rows > 0 and rel == 0) {
+                if (try self.muxFilterHit(a, msg, lx)) |hit| return hit;
+            }
+            if (filter_rows > 0) if (self.mux_dropdown) |dropdown| {
+                if (dropdown.expanded) {
+                    const dropdown_line = rel - filter_rows;
+                    const visible_count = @min(dropdown.max_visible, dropdown.filtered_indices.items.len -| dropdown.y_offset);
+                    if (dropdown_line >= 2 and dropdown_line - 2 < visible_count) return .{ .mux_dropdown_item = dropdown.y_offset + dropdown_line - 2 };
+                    return .{ .region = .table };
+                }
+            };
+            const header_rows = filter_rows + 1;
+            if (rel < header_rows) return .{ .region = .table };
+            const avail = wm.table_h -| header_rows;
             const sigs = msg.signals.items.len;
-            const idx = topFor(self.sel_sig -| 1, sigs, avail) + rel - 1;
-            if (rel - 1 < avail and idx < sigs) return .{ .table_row = idx + 1 };
+            const idx = topFor(self.sel_sig -| 1, sigs, avail) + rel - header_rows;
+            if (rel - header_rows < avail and idx < sigs) return .{ .table_row = idx + 1 };
             return .{ .region = .table };
         }
         return .none;
@@ -1402,7 +1614,7 @@ pub const Model = struct {
             const target: Focus = switch (hit) {
                 .filter, .browser_row => .tree,
                 .map_cell => .map,
-                .table_row, .msg_header => .table,
+                .table_row, .mux_filter, .msg_header => .table,
                 .insp_field, .insp_tab, .insp_apply, .insp_discard => .details,
                 .drawer => .diags,
                 .region => |f| f,
@@ -1419,7 +1631,7 @@ pub const Model = struct {
         }
 
         const leaves = switch (hit) {
-            .browser_row, .map_cell, .table_row, .msg_header => true,
+            .browser_row, .map_cell, .table_row, .mux_filter, .mux_dropdown_item, .msg_header => true,
             else => false,
         };
         if (leaves and self.drafts.items.len > 0) {
@@ -1445,6 +1657,21 @@ pub const Model = struct {
                 if (r.kind == .category) try self.expandCategory(r.cat);
             },
             .ws_tab => |t| self.setWsTab(t),
+            .mux_filter => |selection| {
+                self.focus = .table;
+                if (self.curMsg()) |msg| {
+                    if (selection.edit_value) {
+                        try self.openMuxDropdown(msg, selection.selector_index);
+                    } else self.mux_selector_index = selection.selector_index;
+                }
+            },
+            .mux_dropdown_item => |index| {
+                if (self.mux_dropdown) |*dropdown| {
+                    dropdown.cursor = index;
+                    dropdown.handleKey(.{ .key = .enter });
+                    if (self.curMsg()) |msg| try self.commitMuxDropdown(msg);
+                }
+            },
             .msg_header => {
                 self.focus = if (self.ws_tab == .layout) .table else .tree;
                 self.selectSig(0);
@@ -1875,14 +2102,17 @@ pub const Model = struct {
     fn doExport(self: *Model, path: []const u8) !void {
         if (path.len == 0) return self.setStatus("Error: no path given", .{});
         if (cio.detectFormat(path) == .can_json) return self.setStatus("Export writes DBC; use save for CAN JSON", .{});
+        const bus_index = self.export_bus_index orelse return self.setStatus("Select a bus before exporting", .{});
+        if (bus_index >= self.app.doc.buses.items.len) return self.setStatus("Selected export bus no longer exists", .{});
+        const bus_name = self.app.doc.buses.items[bus_index].name;
         if (self.app.format == .dbc and self.app.isDirty() and vd.hasOpaqueStatements(&self.app.doc)) {
             if (self.app.path) |orig| {
                 if (std.mem.eql(u8, orig, path)) return self.setStatus("Refusing to overwrite the original DBC: edits may break its opaque statements. Choose another path.", .{});
             }
         }
-        self.app.exportDbc(path) catch |e| switch (e) {
-            error.UnsupportedConstruct => {
-                try self.app.revalidate();
+        self.app.exportDbcForBus(bus_name, path) catch |e| switch (e) {
+            error.UnsupportedConstruct, error.UnknownBus => {
+                try self.app.revalidateDbcExport(bus_name);
                 self.show_diag = true;
                 return self.setStatus("Export blocked: document is not representable as DBC (see diagnostics)", .{});
             },
@@ -1893,6 +2123,20 @@ pub const Model = struct {
 
     fn exportCmd(self: *Model) !void {
         try self.app.revalidate();
+        if (self.app.doc.buses.items.len == 0) return self.setStatus("Cannot export DBC: document has no buses", .{});
+        if (self.app.doc.buses.items.len > 1) {
+            self.export_bus_index = null;
+            return self.startInput(.export_bus, "Bus name to export", "");
+        }
+        self.export_bus_index = 0;
+        try self.prepareExport();
+    }
+
+    fn prepareExport(self: *Model) !void {
+        const bus_index = self.export_bus_index orelse return self.setStatus("Select a bus before exporting", .{});
+        if (bus_index >= self.app.doc.buses.items.len) return self.setStatus("Selected export bus no longer exists", .{});
+        const bus_name = self.app.doc.buses.items[bus_index].name;
+        try self.app.revalidateDbcExport(bus_name);
         var items: usize = 0;
         for (self.app.diags.items.items) |d| {
             if (d.group == .export_dbc) items += 1;
@@ -2109,6 +2353,234 @@ pub const Model = struct {
         return finish(a, &out, w, h);
     }
 
+    fn muxSelectorCount(msg: *const can_dbz.model.Message) usize {
+        var count: usize = 0;
+        for (msg.signals.items) |signal| if (signal.is_multiplexer) {
+            count += 1;
+        };
+        return count;
+    }
+
+    fn currentMuxSelector(self: *const Model, msg: *const can_dbz.model.Message) ?*const can_dbz.model.Signal {
+        const selector_count = muxSelectorCount(msg);
+        if (selector_count == 0) return null;
+        const selected_index = self.mux_selector_index % selector_count;
+        var index: usize = 0;
+        for (msg.signals.items) |*signal| {
+            if (!signal.is_multiplexer) continue;
+            if (index == selected_index) return signal;
+            index += 1;
+        }
+        return null;
+    }
+
+    fn appendMuxValue(a: Alloc, values: *std.ArrayListUnmanaged(i128), text: []const u8) !void {
+        const value = std.fmt.parseInt(i128, text, 10) catch return;
+        try appendMuxNumber(a, values, value);
+    }
+
+    fn appendMuxNumber(a: Alloc, values: *std.ArrayListUnmanaged(i128), value: i128) !void {
+        if (values.items.len >= 256) return;
+        for (values.items) |existing| if (existing == value) return;
+        try values.append(a, value);
+    }
+
+    fn muxValues(a: Alloc, doc: *const can_dbz.model.Document, msg: *const can_dbz.model.Message, selector: *const can_dbz.model.Signal) ![]i128 {
+        var values: std.ArrayListUnmanaged(i128) = .empty;
+        for (selector.choices.items) |choice| try appendMuxValue(a, &values, choice.raw);
+        if (selector.value_table) |table_name| {
+            for (doc.value_tables.items) |table| {
+                if (!std.mem.eql(u8, table.name, table_name)) continue;
+                for (table.choices.items) |choice| try appendMuxValue(a, &values, choice.raw);
+            }
+        }
+        for (msg.signals.items) |signal| {
+            for (signal.when.items) |condition| {
+                if (!std.mem.eql(u8, condition.selector, selector.name)) continue;
+                for (condition.ranges.items) |range| {
+                    const minimum = std.fmt.parseInt(i128, range.minimum, 10) catch continue;
+                    const maximum = std.fmt.parseInt(i128, range.maximum, 10) catch continue;
+                    if (minimum > maximum) continue;
+                    const span = @subWithOverflow(maximum, minimum);
+                    if (span[1] != 0 or span[0] > 64) {
+                        try appendMuxValue(a, &values, range.minimum);
+                        try appendMuxValue(a, &values, range.maximum);
+                        continue;
+                    }
+                    var value = minimum;
+                    while (true) {
+                        try appendMuxNumber(a, &values, value);
+                        if (value == maximum or values.items.len >= 256) break;
+                        value += 1;
+                    }
+                }
+            }
+        }
+        return values.items;
+    }
+
+    fn muxFilterState(self: *const Model, msg: *const can_dbz.model.Message, selector: []const u8) ?*const MuxFilterState {
+        for (self.mux_filters.items) |*filter| {
+            if (std.mem.eql(u8, filter.bus, msg.bus) and std.mem.eql(u8, filter.message, msg.name) and std.mem.eql(u8, filter.selector, selector)) return filter;
+        }
+        return null;
+    }
+
+    fn setMuxFilterValue(self: *Model, msg: *const can_dbz.model.Message, selector: []const u8, value: ?i128, custom: bool) !void {
+        for (self.mux_filters.items) |*filter| {
+            if (!std.mem.eql(u8, filter.bus, msg.bus) or !std.mem.eql(u8, filter.message, msg.name) or !std.mem.eql(u8, filter.selector, selector)) continue;
+            filter.value = value;
+            filter.custom = custom;
+            return;
+        }
+        if (value == null) return;
+        const bus = try self.app.gpa.dupe(u8, msg.bus);
+        errdefer self.app.gpa.free(bus);
+        const message = try self.app.gpa.dupe(u8, msg.name);
+        errdefer self.app.gpa.free(message);
+        const selector_copy = try self.app.gpa.dupe(u8, selector);
+        errdefer self.app.gpa.free(selector_copy);
+        try self.mux_filters.append(self.app.gpa, .{ .bus = bus, .message = message, .selector = selector_copy, .value = value, .custom = custom });
+    }
+
+    fn mapOccupancy(self: *const Model, a: Alloc, msg: *const can_dbz.model.Message) !layout.Occupancy {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var filters: std.ArrayListUnmanaged(layout.MuxFilter) = .empty;
+        for (msg.signals.items) |signal| {
+            if (!signal.is_multiplexer) continue;
+            const state = self.muxFilterState(msg, signal.name) orelse continue;
+            if (state.value) |value| try filters.append(arena.allocator(), .{ .selector = signal.name, .value = value });
+        }
+        return layout.occupancyForMuxValues(a, msg, filters.items);
+    }
+
+    fn muxValueLabel(self: *const Model, a: Alloc, msg: *const can_dbz.model.Message, selector: *const can_dbz.model.Signal) ![]const u8 {
+        const state = self.muxFilterState(msg, selector.name) orelse return "All";
+        const value = state.value orelse return "All";
+        return if (state.custom) std.fmt.allocPrint(a, "{d} (custom)", .{value}) else std.fmt.allocPrint(a, "{d}", .{value});
+    }
+
+    fn cycleMuxSelector(self: *Model, msg: *const can_dbz.model.Message, delta: isize) void {
+        const count = muxSelectorCount(msg);
+        if (count == 0) return;
+        self.mux_selector_index = @intCast(@mod(@as(isize, @intCast(self.mux_selector_index)) + delta, @as(isize, @intCast(count))));
+    }
+
+    fn cycleMuxValue(self: *Model, msg: *const can_dbz.model.Message, delta: isize, a: Alloc) !void {
+        const selector = self.currentMuxSelector(msg) orelse return;
+        const values = try muxValues(a, &self.app.doc, msg, selector);
+        const count = values.len + 1;
+        const current = if (self.muxFilterState(msg, selector.name)) |state| state.value else null;
+        var current_index: usize = 0;
+        if (current) |current_value| {
+            for (values, 0..) |value, index| {
+                if (value == current_value) {
+                    current_index = index + 1;
+                    break;
+                }
+            }
+        }
+        const next_index: usize = @intCast(@mod(@as(isize, @intCast(current_index)) + delta, @as(isize, @intCast(count))));
+        const next_value = if (next_index == 0) null else values[next_index - 1];
+        try self.setMuxFilterValue(msg, selector.name, next_value, false);
+    }
+
+    fn muxStatus(self: *const Model, a: Alloc, msg: *const can_dbz.model.Message) ![]const u8 {
+        var status: std.ArrayListUnmanaged(u8) = .empty;
+        try status.appendSlice(a, "Mux filters: ");
+        const active_selector = self.mux_selector_index % muxSelectorCount(msg);
+        var selector_index: usize = 0;
+        for (msg.signals.items) |signal| {
+            if (!signal.is_multiplexer) continue;
+            if (selector_index > 0) try status.appendSlice(a, " | ");
+            try appendPrint(a, &status, "{s}{s} [{s} v]", .{ if (selector_index == active_selector) ">" else "", signal.name, try self.muxValueLabel(a, msg, &signal) });
+            selector_index += 1;
+        }
+        if (selector_index == 0) return "No multiplexer selectors";
+        try status.appendSlice(a, "   click a box to choose");
+        return status.items;
+    }
+
+    fn closeMuxDropdown(self: *Model) void {
+        if (self.mux_dropdown) |*dropdown| {
+            for (dropdown.items.items) |item| {
+                switch (item.value) {
+                    .value => self.app.gpa.free(item.label),
+                    else => {},
+                }
+            }
+            dropdown.deinit();
+        }
+        self.mux_dropdown = null;
+    }
+
+    fn openMuxDropdown(self: *Model, msg: *const can_dbz.model.Message, selector_index: usize) !void {
+        self.closeMuxDropdown();
+        self.mux_selector_index = selector_index;
+        const selector = self.currentMuxSelector(msg) orelse return;
+        var dropdown = MuxDropdown.init(self.app.gpa);
+        errdefer {
+            for (dropdown.items.items) |item| {
+                if (item.value == .value) self.app.gpa.free(item.label);
+            }
+            dropdown.deinit();
+        }
+        dropdown.label = selector.name;
+        dropdown.placeholder = "Choose mux value";
+        dropdown.max_visible = 4;
+        try dropdown.addItem(.init(.all, "All"));
+        var arena = std.heap.ArenaAllocator.init(self.app.gpa);
+        defer arena.deinit();
+        const values = try muxValues(arena.allocator(), &self.app.doc, msg, selector);
+        for (values) |value| {
+            const label = try std.fmt.allocPrint(self.app.gpa, "{d}", .{value});
+            dropdown.addItem(.init(.{ .value = value }, label)) catch |err| {
+                self.app.gpa.free(label);
+                return err;
+            };
+        }
+        try dropdown.addItem(.init(.custom, "Custom value..."));
+        const selected = if (self.muxFilterState(msg, selector.name)) |state| blk: {
+            const value = state.value orelse break :blk 0;
+            if (state.custom) break :blk values.len + 1;
+            for (values, 0..) |option, index| {
+                if (option == value) break :blk index + 1;
+            }
+            break :blk values.len + 1;
+        } else 0;
+        dropdown.selected_index = selected;
+        dropdown.open();
+        self.mux_dropdown = dropdown;
+    }
+
+    fn commitMuxDropdown(self: *Model, msg: *const can_dbz.model.Message) !void {
+        const choice = if (self.mux_dropdown) |dropdown| dropdown.selectedValue() orelse return else return;
+        const selector = self.currentMuxSelector(msg) orelse return;
+        self.closeMuxDropdown();
+        switch (choice) {
+            .all => try self.setMuxFilterValue(msg, selector.name, null, false),
+            .value => |value| try self.setMuxFilterValue(msg, selector.name, value, false),
+            .custom => try self.startInput(.mux_value, "Multiplexer value", ""),
+        }
+    }
+
+    fn onMuxDropdownKey(self: *Model, k: zz.KeyEvent) !bool {
+        const dropdown = if (self.mux_dropdown) |*d| d else return false;
+        if (!dropdown.expanded) return false;
+        dropdown.handleKey(k);
+        if (k.key == .enter and !dropdown.expanded) {
+            const msg = self.curMsg() orelse {
+                self.closeMuxDropdown();
+                return true;
+            };
+            try self.commitMuxDropdown(msg);
+        } else if (k.key == .escape and !dropdown.expanded) {
+            self.closeMuxDropdown();
+        }
+        return true;
+    }
+
     fn rangeText(a: Alloc, ranges: []const can_dbz.model.RawRange) ![]const u8 {
         var s: std.ArrayListUnmanaged(u8) = .empty;
         for (ranges, 0..) |r, i| {
@@ -2119,18 +2591,31 @@ pub const Model = struct {
     }
 
     fn muxPane(self: *const Model, a: Alloc, msg: *const can_dbz.model.Message, w: usize, h: usize) !Lines {
-        _ = self;
         var out: std.ArrayListUnmanaged([]const u8) = .empty;
-        var any = false;
+        const selector_count = muxSelectorCount(msg);
+        if (selector_count == 0) {
+            try out.append(a, try fit(a, "(no multiplexed signals in this message)", w));
+            return finish(a, &out, w, h);
+        }
+        try out.append(a, try fit(a, try self.muxStatus(a, msg), w));
+        const selector = self.currentMuxSelector(msg).?;
+        const active_selector = self.mux_selector_index % selector_count;
+        const values = try muxValues(a, &self.app.doc, msg, selector);
+        var choices: std.ArrayListUnmanaged(u8) = .empty;
+        try choices.appendSlice(a, "Cases: All");
+        for (values) |value| try appendPrint(a, &choices, ", {d}", .{value});
+        try choices.appendSlice(a, ", custom via V");
+        try out.append(a, try fit(a, choices.items, w));
+
+        var selector_ordinal: usize = 0;
         for (msg.signals.items) |s| {
             if (s.is_multiplexer) {
-                any = true;
-                try out.append(a, try fit(a, try std.fmt.allocPrint(a, "Selector: {s}  (start {d}, {d} bits)", .{ s.name, s.start_bit, s.bit_length }), w));
+                try out.append(a, try fit(a, try std.fmt.allocPrint(a, "{s} Selector: {s}  (start {d}, {d} bits)", .{ if (selector_ordinal == active_selector) ">" else " ", s.name, s.start_bit, s.bit_length }), w));
+                selector_ordinal += 1;
             }
         }
         for (msg.signals.items) |s| {
             if (s.when.items.len == 0) continue;
-            any = true;
             var cond: std.ArrayListUnmanaged(u8) = .empty;
             for (s.when.items, 0..) |c, i| {
                 if (i > 0) try cond.appendSlice(a, " AND ");
@@ -2138,9 +2623,8 @@ pub const Model = struct {
             }
             try out.append(a, try fit(a, try std.fmt.allocPrint(a, "  {s}: active when {s}", .{ s.name, cond.items }), w));
         }
-        if (!any) try out.append(a, try fit(a, "(no multiplexed signals in this message)", w));
         try out.append(a, try fit(a, "", w));
-        try out.append(a, try fit(a, "Edit conditions in Inspector > Multiplexing; ranges are inclusive.", w));
+        try out.append(a, try fit(a, "Click a value in the Signals strip to edit; use [/] and ,/. to cycle.", w));
         return finish(a, &out, w, h);
     }
 
@@ -2230,7 +2714,7 @@ pub const Model = struct {
         const q = self.last_search orelse return self.setStatus("No search pattern (use /)", .{});
         var from: ?app_mod.Pos = null;
         if (self.curRow()) |r| switch (r.kind) {
-            .bus, .node, .table, .category, .attr, .meta => {},
+            .bus, .node, .table, .env_var, .category, .attr, .meta => {},
             .message => from = .{ .msg = r.msg },
             .signal => from = .{ .msg = r.msg, .sig = r.sig },
         };
@@ -2341,7 +2825,7 @@ pub const Model = struct {
 
     /// Selects the signal owning the cell under the map cursor; unused cells leave the selection alone.
     fn syncFromMap(self: *Model, msg: *const can_dbz.model.Message) void {
-        var occ = layout.occupancy(self.app.gpa, msg) catch return;
+        var occ = self.mapOccupancy(self.app.gpa, msg) catch return;
         defer occ.deinit(self.app.gpa);
         if (self.map_bit >= occ.cells.len) return;
         const owner = occ.cells[self.map_bit].owner;
@@ -2423,6 +2907,7 @@ pub const Model = struct {
             .signal => self.app.doc.messages.items[row.msg].signals.items[row.sig].name,
             .node => self.app.doc.nodes.items[row.node].name,
             .table => self.app.doc.value_tables.items[row.table].name,
+            .env_var => self.app.doc.environment_variables.items[row.idx].name,
         };
     }
 
@@ -2493,14 +2978,17 @@ pub const Model = struct {
             .add => switch (if (row) |r| (if (r.kind == .category) r.cat else self.tab) else self.tab) {
                 .nodes => try self.startInput(.add_node, "New node name", ""),
                 .tables => try self.startInput(.add_table, "New value table name", ""),
-                .attributes, .metadata => try self.setStatus("Attributes and metadata are read-only for now", .{}),
+                .environment_variables => try self.startInput(.add_environment_variable, "New environment variable name", ""),
+                .attributes => try self.startInput(.add_attribute_definition, "New attribute definition name", ""),
+                .metadata => try self.setStatus("Metadata is read-only for now", .{}),
                 .messages => if (row) |r| switch (r.kind) {
-                    .bus, .category => try self.startInput(.add_message, "New message name", ""),
+                    .category => try self.startInput(.add_bus, "New bus name", ""),
+                    .bus => try self.startInput(.add_message, "New message name", ""),
                     else => {
                         self.anchor_bit = null;
                         try self.startInput(.add_signal, "New signal name", "");
                     },
-                } else try self.setStatus("Add a bus first (:add bus NAME)", .{}),
+                } else try self.startInput(.add_bus, "New bus name", ""),
             },
             .add_bus => {
                 try self.switchTab(.messages);
@@ -2513,8 +3001,8 @@ pub const Model = struct {
             .tab_next => self.setWsTab(@fromBackingInt(@intCast((@backingInt(self.ws_tab) + 1) % ws_titles.len))),
             .tab_prev => self.setWsTab(@fromBackingInt(@intCast((@backingInt(self.ws_tab) + ws_titles.len - 1) % ws_titles.len))),
             .delete => if (row) |r| {
-                if (r.kind == .bus or r.kind == .category or r.kind == .attr or r.kind == .meta) {
-                    try self.setStatus("Only messages, signals, nodes and value tables can be deleted", .{});
+                if (r.kind == .bus or r.kind == .category or r.kind == .meta) {
+                    try self.setStatus("This item cannot be deleted", .{});
                 } else {
                     const txt = try std.fmt.allocPrint(self.app.gpa, "Delete {s} '{s}'?", .{ @tagName(r.kind), self.entityName(r) });
                     defer self.app.gpa.free(txt);
@@ -2661,7 +3149,26 @@ pub const Model = struct {
         switch (self.input_purpose) {
             .open => try self.requestOpen(text),
             .save_as => try self.doSave(text),
+            .export_bus => {
+                const bus_index = ops.findBus(&self.app.doc, text) orelse {
+                    try self.setStatus("Unknown bus '{s}'", .{text});
+                    try self.startInput(.export_bus, "Bus name to export", text);
+                    return .none;
+                };
+                self.export_bus_index = bus_index;
+                try self.prepareExport();
+            },
             .export_dbc => try self.doExport(text),
+            .mux_value => {
+                const value = std.fmt.parseInt(i128, text, 10) catch {
+                    try self.setStatus("Enter a signed integer multiplexer value", .{});
+                    try self.startInput(.mux_value, "Multiplexer value", text);
+                    return .none;
+                };
+                const msg = self.curMsg() orelse return .none;
+                const selector = self.currentMuxSelector(msg) orelse return .none;
+                try self.setMuxFilterValue(msg, selector.name, value, true);
+            },
             .search => {
                 if (text.len == 0) return .none;
                 const dup = try gpa.dupe(u8, text);
@@ -2670,7 +3177,7 @@ pub const Model = struct {
                 try self.runSearch(true);
             },
             .command => return self.runCommand(text),
-            .add_bus, .add_message, .add_signal, .add_node, .add_table => {
+            .add_bus, .add_message, .add_signal, .add_node, .add_table, .add_environment_variable, .add_attribute_definition => {
                 const cur = self.curRow() orelse Row{ .kind = .bus, .bus = 0 };
                 try self.doAdd(self.input_purpose, cur, text);
             },
@@ -2679,6 +3186,8 @@ pub const Model = struct {
                     .message => .{ .m = .name },
                     .node => .{ .n = .name },
                     .table => .{ .t = .name },
+                    .env_var => .{ .ev = .name },
+                    .attr => .{ .ad = .name },
                     else => .{ .s = .name },
                 };
                 if (!try self.applyTag(row, tag, text)) self.retainDraft();
@@ -2765,6 +3274,35 @@ pub const Model = struct {
         return .none;
     }
 
+    fn onMuxControlKey(self: *Model, k: zz.KeyEvent) !bool {
+        if (self.tab != .messages or (self.ws_tab != .layout and self.ws_tab != .mux) or self.drafts.items.len > 0) return false;
+        if (self.focus != .tree and self.focus != .map and self.focus != .table) return false;
+        const msg = self.curMsg() orelse return false;
+        if (muxSelectorCount(msg) == 0) return false;
+        if (k.modifiers.ctrl or k.modifiers.alt or k.modifiers.shift) return false;
+        const character = switch (k.key) {
+            .char => |c| std.ascii.toLower(@intCast(c)),
+            else => return false,
+        };
+        switch (character) {
+            '[' => self.cycleMuxSelector(msg, -1),
+            ']' => self.cycleMuxSelector(msg, 1),
+            ',' => {
+                var arena = std.heap.ArenaAllocator.init(self.app.gpa);
+                defer arena.deinit();
+                try self.cycleMuxValue(msg, -1, arena.allocator());
+            },
+            '.' => {
+                var arena = std.heap.ArenaAllocator.init(self.app.gpa);
+                defer arena.deinit();
+                try self.cycleMuxValue(msg, 1, arena.allocator());
+            },
+            'v' => try self.startInput(.mux_value, "Multiplexer value", ""),
+            else => return false,
+        }
+        return true;
+    }
+
     fn onKey(self: *Model, k: zz.KeyEvent) anyerror!zz.Cmd(Msg) {
         switch (self.mode) {
             .help => {
@@ -2781,6 +3319,7 @@ pub const Model = struct {
             .welcome => return self.onWelcomeKey(k),
             .normal => {},
         }
+        if (try self.onMuxDropdownKey(k)) return .none;
         const chord = chordOf(k);
         const action: ?Action = if (chord) |c| self.keymap.lookup(c) else null;
         if (self.editing) {
@@ -2796,6 +3335,7 @@ pub const Model = struct {
             if (try self.onFormKey(k)) return .none;
         }
         if (action) |a| return self.do(a);
+        if (try self.onMuxControlKey(k)) return .none;
         if (self.focus == .filter) return self.onFilterKey(k);
         if (self.focus == .payload) return self.onPayloadKey(k);
         switch (k.key) {
@@ -2929,6 +3469,7 @@ pub const Model = struct {
             .bus => std.fmt.allocPrint(a, "# {s}", .{doc.buses.items[row.bus].name}),
             .category => std.fmt.allocPrint(a, "{s} {s} ({d})", .{ if (row.cat == self.tab) "-" else "+", tab_titles[@backingInt(row.cat)], self.categoryCount(row.cat) }),
             .attr => std.fmt.allocPrint(a, "  {s}", .{doc.attribute_definitions.items[row.idx].name}),
+            .env_var => std.fmt.allocPrint(a, "  $ {s}", .{doc.environment_variables.items[row.idx].name}),
             .meta => std.fmt.allocPrint(a, "  {s}", .{meta_labels[row.idx]}),
             .node => std.fmt.allocPrint(a, "@ {s}", .{doc.nodes.items[row.node].name}),
             .table => std.fmt.allocPrint(a, "= {s} ({d})", .{ doc.value_tables.items[row.table].name, doc.value_tables.items[row.table].choices.items.len }),
@@ -3415,7 +3956,7 @@ pub const Model = struct {
             try out.append(a, try fit(a, "(0-byte payload: nothing to map)", w));
             return finish(a, &out, w, h);
         }
-        const occ = try layout.occupancy(a, msg);
+        const occ = try self.mapOccupancy(a, msg);
         const mm = mapMetrics(w, h, nbytes, self.map_bit);
         const detail = mm.detail;
         const avail = mm.avail;
@@ -3492,6 +4033,16 @@ pub const Model = struct {
 
     fn paneTable(self: *const Model, a: Alloc, msg: *const can_dbz.model.Message, w: usize, h: usize) !Lines {
         var out: std.ArrayListUnmanaged([]const u8) = .empty;
+        const has_mux = muxSelectorCount(msg) > 0;
+        if (has_mux) try out.append(a, try fit(a, try self.muxStatus(a, msg), w));
+        if (self.mux_dropdown) |dropdown| {
+            if (dropdown.expanded) {
+                const dropdown_text = try dropdown.view(a);
+                var lines = std.mem.splitScalar(u8, dropdown_text, '\n');
+                while (lines.next()) |line| try out.append(a, try fit(a, line, w));
+                return finish(a, &out, w, h);
+            }
+        }
         const full = w >= 50;
         const name_w: usize = if (full) 16 else @max(w -| 23, 5);
         const end_w: usize = if (full) 5 else 3;
@@ -3509,7 +4060,7 @@ pub const Model = struct {
             try fit(a, if (full) "Notes" else "Nts", note_w),
         });
         try out.append(a, try fit(a, head, w));
-        const avail = h -| 1;
+        const avail = h -| (if (has_mux) @as(usize, 2) else 1);
         const sigs = msg.signals.items;
         if (sigs.len == 0 and avail > 0) try out.append(a, try fit(a, "(no signals: Enter on a map cell, or press a)", w));
         const top = topFor(self.sel_sig -| 1, sigs.len, avail);
@@ -3950,22 +4501,146 @@ test "browser lists categories, expands one at a time and filters messages" {
     _ = try ops.addMessage(&m.app.doc, "can0", "Brakes");
     _ = try ops.addNode(&m.app.doc, "ECU");
     try m.rebuildRows();
-    // 5 categories + bus + 2 messages
-    try std.testing.expectEqual(@as(usize, 8), m.rows.items.len);
+    // 6 categories + bus + 2 messages
+    try std.testing.expectEqual(@as(usize, 9), m.rows.items.len);
     try m.expandCategory(.nodes);
-    try std.testing.expectEqual(@as(usize, 6), m.rows.items.len);
+    try std.testing.expectEqual(@as(usize, 7), m.rows.items.len);
     try m.expandCategory(.messages);
     try m.filter_buf.appendSlice(std.testing.allocator, "brak");
     try m.rebuildRows();
-    try std.testing.expectEqual(@as(usize, 7), m.rows.items.len);
+    try std.testing.expectEqual(@as(usize, 8), m.rows.items.len);
     m.filter_buf.clearRetainingCapacity();
     try m.filter_buf.appendSlice(std.testing.allocator, "0x101");
     try m.rebuildRows();
-    try std.testing.expectEqual(@as(usize, 7), m.rows.items.len);
+    try std.testing.expectEqual(@as(usize, 8), m.rows.items.len);
     m.filter_buf.clearRetainingCapacity();
     try m.filter_buf.appendSlice(std.testing.allocator, "frame:fd");
     try m.rebuildRows();
-    try std.testing.expectEqual(@as(usize, 5), m.rows.items.len);
+    try std.testing.expectEqual(@as(usize, 6), m.rows.items.len);
+}
+
+test "environment variables are addable and expose editable fields" {
+    var m: Model = .{ .app = try App.init(std.testing.allocator, undefined) };
+    defer m.deinit();
+    try m.doAdd(.add_environment_variable, .{ .kind = .category, .bus = 0, .cat = .environment_variables }, "Ambient");
+    try std.testing.expectEqual(@as(usize, 1), m.app.doc.environment_variables.items.len);
+    try std.testing.expect(m.tab == .environment_variables);
+    const row = m.curRow().?;
+    try std.testing.expect(row.kind == .env_var);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fields = try m.fieldsFor(arena.allocator(), row);
+    try std.testing.expectEqual(std.meta.fieldNames(ops.EnvironmentVariableField).len, fields.len);
+    try std.testing.expectEqualStrings("Ambient", fields[0].value);
+    try std.testing.expectEqualStrings("integer", fields[1].value);
+}
+
+test "scoped attributes are editable from their owning inspector" {
+    var m: Model = .{ .app = try App.init(std.testing.allocator, undefined) };
+    defer m.deinit();
+    try m.doAdd(.add_attribute_definition, .{ .kind = .category, .bus = 0, .cat = .attributes }, "InitialValue");
+    const definition_row = m.curRow().?;
+    try std.testing.expect(definition_row.kind == .attr);
+    try std.testing.expect(try m.applyTag(definition_row, .{ .ad = .value_type }, "integer"));
+    const definition_index = definition_row.idx;
+    const message_index = try ops.addMessage(&m.app.doc, "can0", "Status");
+    const row: Row = .{ .kind = .message, .bus = 0, .msg = message_index };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fields = try m.fieldsFor(arena.allocator(), row);
+    var found = false;
+    for (fields) |field| {
+        if (!std.mem.eql(u8, field.label, "InitialValue")) continue;
+        found = true;
+        try std.testing.expect(field.tag == .aa);
+        try std.testing.expectEqualStrings("", field.value);
+    }
+    try std.testing.expect(found);
+    try std.testing.expect(try m.applyTag(row, .{ .aa = definition_index }, "12"));
+    try std.testing.expectEqual(@as(usize, 1), m.app.doc.messages.items[message_index].attributes.items.len);
+    try std.testing.expectEqualStrings("12", m.app.doc.messages.items[message_index].attributes.items[0].value.integer);
+}
+
+test "metadata fields edit document strings and structured JSON" {
+    var m: Model = .{ .app = try App.init(std.testing.allocator, undefined) };
+    defer m.deinit();
+    const name_row: Row = .{ .kind = .meta, .bus = 0, .idx = 0 };
+    const description_row: Row = .{ .kind = .meta, .bus = 0, .idx = 1 };
+    const version_row: Row = .{ .kind = .meta, .bus = 0, .idx = 2 };
+    const extensions_row: Row = .{ .kind = .meta, .bus = 0, .idx = 3 };
+
+    try std.testing.expect(try m.applyTag(name_row, .{ .md = .document_name }, "Vehicle"));
+    try std.testing.expect(try m.applyTag(description_row, .{ .md = .description }, "CAN database"));
+    try std.testing.expect(try m.applyTag(version_row, .{ .md = .dbc_version }, "1.0"));
+    try std.testing.expect(try m.applyTag(extensions_row, .{ .md = .extensions }, "{\"vendor\":{\"revision\":2}}"));
+    try std.testing.expectEqualStrings("Vehicle", m.app.doc.name.?);
+    try std.testing.expectEqualStrings("CAN database", m.app.doc.description.?);
+    try std.testing.expectEqualStrings("1.0", m.app.doc.dbc.?.object.get("version").?.string);
+    try std.testing.expect(m.app.doc.extensions.? == .object);
+    try std.testing.expect(!try m.applyTag(extensions_row, .{ .md = .extensions }, "[]"));
+    try std.testing.expect(m.app.doc.extensions.? == .object);
+}
+
+test "bus definition fields are editable including metadata description" {
+    var m: Model = .{ .app = try App.init(std.testing.allocator, undefined) };
+    defer m.deinit();
+    const row: Row = .{ .kind = .bus, .bus = 0 };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const fields = try m.formFields(arena.allocator(), row);
+    try std.testing.expectEqual(@as(usize, 5), fields.len);
+    for (fields) |field| try std.testing.expect(field.tag == .b);
+    try std.testing.expectEqualStrings("description", fields[4].label);
+    try std.testing.expect(fields[4].group == .metadata);
+
+    try std.testing.expect(try m.applyTag(row, .{ .b = .name }, "powertrain"));
+    try std.testing.expect(try m.applyTag(row, .{ .b = .nominal_bitrate }, "500000"));
+    try std.testing.expect(try m.applyTag(row, .{ .b = .data_bitrate }, "2000000"));
+    try std.testing.expect(try m.applyTag(row, .{ .b = .protocol }, "CAN FD"));
+    try std.testing.expect(try m.applyTag(row, .{ .b = .description }, "Vehicle network"));
+    try std.testing.expectEqualStrings("powertrain", m.app.doc.buses.items[0].name);
+    try std.testing.expectEqualStrings("Vehicle network", m.app.doc.buses.items[0].description.?);
+}
+
+test "New item from the Messages category creates a bus" {
+    var m: Model = .{ .app = try App.init(std.testing.allocator, undefined) };
+    defer m.deinit();
+    try m.rebuildRows();
+    m.selectRow(.{ .kind = .category, .bus = 0, .cat = .messages });
+
+    _ = try m.do(.add);
+    try std.testing.expect(m.mode == .input);
+    try std.testing.expect(m.input_purpose == .add_bus);
+    try m.input_buf.appendSlice(std.testing.allocator, "body");
+    _ = try m.submitInput();
+
+    try std.testing.expectEqual(@as(usize, 2), m.app.doc.buses.items.len);
+    try std.testing.expectEqualStrings("body", m.app.doc.buses.items[1].name);
+}
+
+test "multi-bus export prompts for a bus and reviews that bus" {
+    var m: Model = .{ .app = try App.init(std.testing.allocator, undefined) };
+    defer m.deinit();
+    _ = try ops.addBus(&m.app.doc, "can1");
+
+    try m.exportCmd();
+    try std.testing.expect(m.mode == .input);
+    try std.testing.expect(m.input_purpose == .export_bus);
+    try m.input_buf.appendSlice(std.testing.allocator, "missing");
+    _ = try m.submitInput();
+    try std.testing.expect(m.mode == .input);
+    try std.testing.expectEqualStrings("missing", m.input_buf.items);
+    m.input_buf.clearRetainingCapacity();
+    try m.input_buf.appendSlice(std.testing.allocator, "can1");
+    _ = try m.submitInput();
+
+    try std.testing.expect(m.mode == .review);
+    try std.testing.expect(!m.reviewBlocked());
+    try std.testing.expectEqual(@as(?usize, 1), m.export_bus_index);
+    try std.testing.expectEqual(@as(usize, 1), m.app.diags.items.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, m.app.diags.items.items[0].text, "bus name") != null);
 }
 
 test "menu runs the chosen action and the view renders every mode" {
@@ -4219,6 +4894,104 @@ test "multiplexer conditions can be drafted, validated, applied and viewed" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Temperature: active when Page = 1,2..4 AND Mode = 3") != null);
 }
 
+test "layout mux controls cycle cases and filter inactive branches" {
+    var m: Model = .{ .app = try App.init(std.testing.allocator, undefined) };
+    defer m.deinit();
+    const msg_index = try ops.addMessage(&m.app.doc, "can0", "Status");
+    const page = try ops.addSignal(&m.app.doc, msg_index, "Page");
+    try ops.setSignalField(&m.app.doc, msg_index, page, .bit_length, "2");
+    try ops.setSignalField(&m.app.doc, msg_index, page, .is_multiplexer, "true");
+    const first = try ops.addSignal(&m.app.doc, msg_index, "First");
+    try ops.setSignalField(&m.app.doc, msg_index, first, .start_bit, "8");
+    try ops.setSignalField(&m.app.doc, msg_index, first, .when, "Page=1");
+    const second = try ops.addSignal(&m.app.doc, msg_index, "Second");
+    try ops.setSignalField(&m.app.doc, msg_index, second, .start_bit, "8");
+    try ops.setSignalField(&m.app.doc, msg_index, second, .when, "Page=2");
+    const common = try ops.addSignal(&m.app.doc, msg_index, "Common");
+    try ops.setSignalField(&m.app.doc, msg_index, common, .start_bit, "16");
+    try ops.setMessageField(&m.app.doc, msg_index, .length, "3");
+    try m.rebuildRows();
+    m.selectRow(.{ .kind = .message, .bus = 0, .msg = msg_index });
+    m.focus = .map;
+
+    _ = try m.onKey(.{ .key = .{ .char = '.' } });
+    var occ = try m.mapOccupancy(std.testing.allocator, &m.app.doc.messages.items[msg_index]);
+    defer occ.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, @intCast(first)), occ.cells[8].owner);
+    try std.testing.expectEqual(@as(u16, @intCast(common)), occ.cells[16].owner);
+    try std.testing.expect(!occ.cells[8].collision);
+
+    _ = try m.onKey(.{ .key = .{ .char = '.' } });
+    var second_occ = try m.mapOccupancy(std.testing.allocator, &m.app.doc.messages.items[msg_index]);
+    defer second_occ.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, @intCast(second)), second_occ.cells[8].owner);
+
+    _ = try m.onKey(.{ .key = .{ .char = 'v' } });
+    try std.testing.expect(m.mode == .input and m.input_purpose == .mux_value);
+    try m.input_buf.appendSlice(std.testing.allocator, "1");
+    _ = try m.submitInput();
+    const page_filter = m.muxFilterState(&m.app.doc.messages.items[msg_index], "Page").?;
+    try std.testing.expectEqual(@as(?i128, 1), page_filter.value);
+    try std.testing.expect(page_filter.custom);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const lines = try m.paneTable(arena.allocator(), &m.app.doc.messages.items[msg_index], 80, 10);
+    const rendered = try std.mem.join(arena.allocator(), "\n", lines);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Mux filters: >Page [1 (custom) v]") != null);
+}
+
+test "nested layout filters retain parent and child selector values" {
+    var m: Model = .{ .app = try App.init(std.testing.allocator, undefined) };
+    defer m.deinit();
+    const msg_index = try ops.addMessage(&m.app.doc, "can0", "Nested");
+    const page = try ops.addSignal(&m.app.doc, msg_index, "Page");
+    try ops.setSignalField(&m.app.doc, msg_index, page, .bit_length, "2");
+    try ops.setSignalField(&m.app.doc, msg_index, page, .is_multiplexer, "true");
+    const mode = try ops.addSignal(&m.app.doc, msg_index, "Mode");
+    try ops.setSignalField(&m.app.doc, msg_index, mode, .start_bit, "2");
+    try ops.setSignalField(&m.app.doc, msg_index, mode, .bit_length, "2");
+    try ops.setSignalField(&m.app.doc, msg_index, mode, .is_multiplexer, "true");
+    try ops.setSignalField(&m.app.doc, msg_index, mode, .when, "Page=1");
+    const active = try ops.addSignal(&m.app.doc, msg_index, "ActiveBranch");
+    try ops.setSignalField(&m.app.doc, msg_index, active, .start_bit, "8");
+    try ops.setSignalField(&m.app.doc, msg_index, active, .when, "Page=1; Mode=2");
+    const sibling = try ops.addSignal(&m.app.doc, msg_index, "SiblingBranch");
+    try ops.setSignalField(&m.app.doc, msg_index, sibling, .start_bit, "8");
+    try ops.setSignalField(&m.app.doc, msg_index, sibling, .when, "Page=1; Mode=3");
+    try ops.setMessageField(&m.app.doc, msg_index, .length, "2");
+    try m.rebuildRows();
+    m.selectRow(.{ .kind = .message, .bus = 0, .msg = msg_index });
+    m.focus = .table;
+
+    _ = try m.onKey(.{ .key = .{ .char = '.' } });
+    _ = try m.onKey(.{ .key = .{ .char = ']' } });
+    _ = try m.onKey(.{ .key = .{ .char = '.' } });
+
+    var occ = try m.mapOccupancy(std.testing.allocator, &m.app.doc.messages.items[msg_index]);
+    defer occ.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, @intCast(active)), occ.cells[8].owner);
+    try std.testing.expect(!occ.cells[8].collision);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const lines = try m.paneTable(arena.allocator(), &m.app.doc.messages.items[msg_index], 100, 8);
+    const rendered = try std.mem.join(arena.allocator(), "\n", lines);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Page [1 v] | >Mode [2 v]") != null);
+
+    const other_message = try ops.addMessage(&m.app.doc, "can0", "Other");
+    const other_page = try ops.addSignal(&m.app.doc, other_message, "Page");
+    try ops.setSignalField(&m.app.doc, other_message, other_page, .is_multiplexer, "true");
+    try m.rebuildRows();
+    m.selectRow(.{ .kind = .message, .bus = 0, .msg = other_message });
+    const other_lines = try m.paneTable(arena.allocator(), &m.app.doc.messages.items[other_message], 100, 8);
+    const other_rendered = try std.mem.join(arena.allocator(), "\n", other_lines);
+    try std.testing.expect(std.mem.indexOf(u8, other_rendered, ">Page [All v]") != null);
+    m.selectRow(.{ .kind = .message, .bus = 0, .msg = msg_index });
+    const restored_lines = try m.paneTable(arena.allocator(), &m.app.doc.messages.items[msg_index], 100, 8);
+    const restored_rendered = try std.mem.join(arena.allocator(), "\n", restored_lines);
+    try std.testing.expect(std.mem.indexOf(u8, restored_rendered, "Page [1 v] | >Mode [2 v]") != null);
+}
+
 fn click(x: u16, y: u16) zz.MouseEvent {
     return .{ .x = x, .y = y, .button = .left, .event_type = .press };
 }
@@ -4251,6 +5024,54 @@ test "mouse selects browser rows, map cells and table rows" {
     _ = try m.onMouse(click(31, 18));
     try std.testing.expect(m.focus == .table);
     try std.testing.expectEqual(@as(usize, 1), m.sel_sig);
+}
+
+test "mux filter values are individually mouse-editable and signals hit the correct row" {
+    var m: Model = .{ .app = try App.init(std.testing.allocator, undefined) };
+    defer m.deinit();
+    const msg_index = try ops.addMessage(&m.app.doc, "can0", "Nested");
+    const page = try ops.addSignal(&m.app.doc, msg_index, "Page");
+    try ops.setSignalField(&m.app.doc, msg_index, page, .is_multiplexer, "true");
+    const sub_id = try ops.addSignal(&m.app.doc, msg_index, "SubId");
+    try ops.setSignalField(&m.app.doc, msg_index, sub_id, .is_multiplexer, "true");
+    try ops.setSignalField(&m.app.doc, msg_index, sub_id, .when, "Page=1");
+    const data = try ops.addSignal(&m.app.doc, msg_index, "Data");
+    try ops.setSignalField(&m.app.doc, msg_index, data, .when, "Page=1; SubId=10");
+    try m.rebuildRows();
+    m.selectRow(.{ .kind = .message, .bus = 0, .msg = msg_index });
+    m.term_w = 120;
+    m.term_h = 36;
+    m.focus = .table;
+
+    const panes = m.paneLayout(m.term_w, m.term_h);
+    const workspace = panes.slots[1];
+    const main_h = @as(usize, m.term_h) - 5;
+    const workspace_h = main_h - 2;
+    const metrics = m.wsMetrics(workspace_h, panes.stacked and panes.n > 1, m.app.doc.messages.items[msg_index].length);
+    const filter_y: u16 = @intCast(3 + metrics.table_y);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const msg = &m.app.doc.messages.items[msg_index];
+    var status = try m.muxStatus(arena.allocator(), msg);
+    var value_start = std.mem.indexOf(u8, status, "Page [All v]").? + "Page [".len;
+    _ = try m.onMouse(click(@intCast(workspace.x + 1 + value_start), filter_y));
+    try std.testing.expect(m.mux_dropdown != null and m.mux_dropdown.?.expanded);
+    _ = try m.onMouse(click(@intCast(workspace.x + 1 + value_start), filter_y + 4));
+    try std.testing.expect(m.mux_dropdown == null);
+
+    status = try m.muxStatus(arena.allocator(), msg);
+    value_start = std.mem.indexOf(u8, status, "SubId [All v]").? + "SubId [".len;
+    _ = try m.onMouse(click(@intCast(workspace.x + 1 + value_start), filter_y));
+    try std.testing.expect(m.mux_dropdown != null and m.mux_dropdown.?.expanded);
+    _ = try m.onKey(.{ .key = .down });
+    _ = try m.onKey(.{ .key = .enter });
+    try std.testing.expectEqual(@as(?i128, 1), m.muxFilterState(msg, "Page").?.value);
+    try std.testing.expectEqual(@as(?i128, 10), m.muxFilterState(msg, "SubId").?.value);
+
+    _ = try m.onMouse(click(@intCast(workspace.x + 1 + 5), filter_y + 4));
+    try std.testing.expect(m.focus == .table);
+    try std.testing.expectEqual(data + 1, m.sel_sig);
 }
 
 test "mouse hits the menu bar, workspace tabs and inspector buttons" {

@@ -33,6 +33,11 @@ pub const Cell = struct {
     collision: bool = false,
 };
 
+pub const MuxFilter = struct {
+    selector: []const u8,
+    value: i128,
+};
+
 pub const Occupancy = struct {
     cells: []Cell,
     /// Signals with bits beyond the payload, as indices into the message's signal list.
@@ -71,11 +76,21 @@ fn rangesOverlap(x: []const model.RawRange, y: []const model.RawRange) bool {
 
 /// One cell per payload bit. A collision is two signals on one bit that can be active together.
 pub fn occupancy(gpa: std.mem.Allocator, msg: *const model.Message) !Occupancy {
+    return occupancyForMuxValues(gpa, msg, &.{});
+}
+
+pub fn occupancyForMuxValue(gpa: std.mem.Allocator, msg: *const model.Message, selector: []const u8, value: i128) !Occupancy {
+    const filter: MuxFilter = .{ .selector = selector, .value = value };
+    return occupancyForMuxValues(gpa, msg, &.{filter});
+}
+
+pub fn occupancyForMuxValues(gpa: std.mem.Allocator, msg: *const model.Message, filters: []const MuxFilter) !Occupancy {
     const cells = try gpa.alloc(Cell, @as(usize, msg.length) * 8);
     @memset(cells, .{});
     var occ: Occupancy = .{ .cells = cells };
     errdefer occ.deinit(gpa);
     for (msg.signals.items, 0..) |*sig, si| {
+        if (!matchesMuxValues(sig, filters)) continue;
         var it = BitIter.init(sig);
         var outside = false;
         while (it.next()) |bit| {
@@ -94,6 +109,47 @@ pub fn occupancy(gpa: std.mem.Allocator, msg: *const model.Message) !Occupancy {
         if (outside) try occ.out_of_bounds.append(gpa, @intCast(si));
     }
     return occ;
+}
+
+/// Keeps common signals and signals whose condition on `selector` contains `value`.
+/// Malformed or empty ranges remain visible so uncertain data is never hidden.
+pub fn matchesMuxValue(sig: *const model.Signal, selector: []const u8, value: i128) bool {
+    const filter: MuxFilter = .{ .selector = selector, .value = value };
+    return matchesMuxValues(sig, &.{filter});
+}
+
+pub fn matchesMuxValues(sig: *const model.Signal, filters: []const MuxFilter) bool {
+    for (sig.when.items) |condition| {
+        var selected_value: ?i128 = null;
+        for (filters) |filter| {
+            if (std.mem.eql(u8, condition.selector, filter.selector)) {
+                selected_value = filter.value;
+                break;
+            }
+        }
+        const value = selected_value orelse continue;
+        if (condition.ranges.items.len == 0) continue;
+        var matches = false;
+        var uncertain = false;
+        for (condition.ranges.items) |range| {
+            const minimum = std.fmt.parseInt(i128, range.minimum, 10) catch {
+                uncertain = true;
+                break;
+            };
+            const maximum = std.fmt.parseInt(i128, range.maximum, 10) catch {
+                uncertain = true;
+                break;
+            };
+            if (minimum > maximum) {
+                uncertain = true;
+                break;
+            }
+            if (minimum <= value and value <= maximum) matches = true;
+        }
+        if (uncertain) continue;
+        if (!matches) return false;
+    }
+    return true;
 }
 
 /// Lowest and highest payload byte a signal touches, or null when the signal has no bits.
@@ -202,6 +258,79 @@ test "mutually exclusive mux branches do not collide, overlapping ones do" {
     occ = try occupancy(std.testing.allocator, &msg);
     defer occ.deinit(std.testing.allocator);
     try std.testing.expect(occ.cells[8].collision);
+}
+
+test "mux value occupancy hides other branches and rebuilds shared bits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var msg: model.Message = .{ .name = "M", .bus = "can0", .id = "0x1", .extended = false, .frame = .classic, .length = 4 };
+    var selector = testSignal(.little_endian, 0, 8);
+    selector.name = "Page";
+    selector.is_multiplexer = true;
+    try msg.signals.append(a, selector);
+    var page_one = testSignal(.little_endian, 8, 8);
+    page_one.name = "A";
+    try page_one.when.append(a, .{ .selector = "Page", .ranges = try rangeList(a, "1", "1") });
+    try msg.signals.append(a, page_one);
+    var page_two = testSignal(.little_endian, 8, 8);
+    page_two.name = "B";
+    try page_two.when.append(a, .{ .selector = "Page", .ranges = try rangeList(a, "2", "2") });
+    try msg.signals.append(a, page_two);
+    try msg.signals.append(a, testSignal(.little_endian, 16, 8));
+
+    var occ = try occupancyForMuxValue(std.testing.allocator, &msg, "Page", 1);
+    defer occ.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 1), occ.cells[8].owner);
+    try std.testing.expect(!occ.cells[8].collision);
+    try std.testing.expectEqual(@as(u16, 3), occ.cells[16].owner);
+    try std.testing.expect(matchesMuxValue(&msg.signals.items[1], "Page", 1));
+    try std.testing.expect(!matchesMuxValue(&msg.signals.items[2], "Page", 1));
+}
+
+test "nested mux filters require every selected condition to match" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var msg: model.Message = .{ .name = "M", .bus = "can0", .id = "0x1", .extended = false, .frame = .classic, .length = 4 };
+    var page = testSignal(.little_endian, 0, 8);
+    page.name = "Page";
+    page.is_multiplexer = true;
+    try msg.signals.append(a, page);
+    var mode = testSignal(.little_endian, 1, 2);
+    mode.name = "Mode";
+    mode.is_multiplexer = true;
+    try mode.when.append(a, .{ .selector = "Page", .ranges = try rangeList(a, "1", "1") });
+    try msg.signals.append(a, mode);
+    inline for (.{
+        .{ "Selected", "2", "1" },
+        .{ "OtherMode", "3", "1" },
+        .{ "OtherPage", "2", "2" },
+    }) |definition| {
+        var signal = testSignal(.little_endian, 8, 8);
+        signal.name = definition[0];
+        try signal.when.append(a, .{ .selector = "Page", .ranges = try rangeList(a, definition[2], definition[2]) });
+        try signal.when.append(a, .{ .selector = "Mode", .ranges = try rangeList(a, definition[1], definition[1]) });
+        try msg.signals.append(a, signal);
+    }
+
+    const filters = [_]MuxFilter{
+        .{ .selector = "Page", .value = 1 },
+        .{ .selector = "Mode", .value = 2 },
+    };
+    var occ = try occupancyForMuxValues(std.testing.allocator, &msg, &filters);
+    defer occ.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 2), occ.cells[8].owner);
+    try std.testing.expect(!occ.cells[8].collision);
+    try std.testing.expect(matchesMuxValues(&msg.signals.items[2], &filters));
+    try std.testing.expect(!matchesMuxValues(&msg.signals.items[3], &filters));
+    try std.testing.expect(!matchesMuxValues(&msg.signals.items[4], &filters));
+}
+
+fn rangeList(a: std.mem.Allocator, minimum: []const u8, maximum: []const u8) !std.ArrayListUnmanaged(model.RawRange) {
+    var ranges: std.ArrayListUnmanaged(model.RawRange) = .empty;
+    try ranges.append(a, .{ .minimum = minimum, .maximum = maximum });
+    return ranges;
 }
 
 test "a common signal overlapping a branch signal is a collision" {

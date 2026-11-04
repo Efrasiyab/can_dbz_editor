@@ -111,16 +111,25 @@ fn dupeOpt(gpa: std.mem.Allocator, s: ?[]const u8) !?[]const u8 {
 /// General validation: semantic checks plus DBC export feasibility.
 pub fn validateAll(gpa: std.mem.Allocator, doc: *const can_dbz.model.Document, list: *List) !void {
     list.clearGroup(.validation);
-    list.clearGroup(.export_dbc);
 
     var diags: std.ArrayListUnmanaged(can_dbz.diagnostic.Diagnostic) = .empty;
     defer diags.deinit(gpa);
     _ = try can_dbz.validate.validateDocument(doc, gpa, &diags);
     try list.addAll(.validation, diags.items, true);
 
+    try validateDbcExport(gpa, doc, list, null);
+}
+
+/// Checks DBC export feasibility for one bus, or for the whole document when `bus_name` is null.
+pub fn validateDbcExport(gpa: std.mem.Allocator, doc: *const can_dbz.model.Document, list: *List, bus_name: ?[]const u8) !void {
+    list.clearGroup(.export_dbc);
+
     var blockers: std.ArrayListUnmanaged(can_dbz.diagnostic.Diagnostic) = .empty;
     defer blockers.deinit(gpa);
-    const written = can_dbz.formats.dbc.writeWithDiagnostics(gpa, doc, &blockers);
+    const written = if (bus_name) |name|
+        can_dbz.formats.dbc.writeForBusWithDiagnostics(gpa, doc, name, &blockers)
+    else
+        can_dbz.formats.dbc.writeWithDiagnostics(gpa, doc, &blockers);
     for (blockers.items) |d| try list.addExport(d);
     if (written) |bytes| {
         gpa.free(bytes);
@@ -130,6 +139,12 @@ pub fn validateAll(gpa: std.mem.Allocator, doc: *const can_dbz.model.Document, l
             try list.addExport(.{ .severity = .@"error", .code = .unsupported_dbc_export, .message = "document contains constructs the supported DBC profile cannot express" });
         },
         error.InvalidDbc => try list.addExport(.{ .severity = .@"error", .code = .unsupported_dbc_export, .message = "document is not representable as DBC" }),
+        error.UnknownBus => {
+            for (blockers.items) |d| {
+                if (d.code == .unknown_bus) return;
+            }
+            try list.addExport(.{ .severity = .@"error", .code = .unknown_bus, .message = "DBC export references a bus that is not defined" });
+        },
     }
 }
 
@@ -157,4 +172,33 @@ test "export items separate blockers from omissions" {
     }
     try std.testing.expect(blocking >= 1);
     try std.testing.expect(omitted >= 1);
+}
+
+test "selected bus export reviews only that bus and reports DBC name loss" {
+    var doc = can_dbz.model.Document.init(std.testing.allocator);
+    defer doc.deinit();
+    try doc.buses.append(doc.allocator(), .{ .name = "can0" });
+    try doc.buses.append(doc.allocator(), .{ .name = "can1" });
+    var list = List.init(std.testing.allocator);
+    defer list.deinit();
+
+    try validateDbcExport(std.testing.allocator, &doc, &list, "can1");
+
+    try std.testing.expectEqual(@as(usize, 1), list.items.items.len);
+    try std.testing.expect(!list.items.items[0].blocking);
+    try std.testing.expect(std.mem.indexOf(u8, list.items.items[0].text, "bus name") != null);
+}
+
+test "selected bus export blocks unknown bus names once" {
+    var doc = can_dbz.model.Document.init(std.testing.allocator);
+    defer doc.deinit();
+    try doc.buses.append(doc.allocator(), .{ .name = "can0" });
+    var list = List.init(std.testing.allocator);
+    defer list.deinit();
+
+    try validateDbcExport(std.testing.allocator, &doc, &list, "missing");
+
+    try std.testing.expectEqual(@as(usize, 1), list.items.items.len);
+    try std.testing.expect(list.items.items[0].blocking);
+    try std.testing.expect(std.mem.indexOf(u8, list.items.items[0].text, "selected DBC export bus is not defined") != null);
 }

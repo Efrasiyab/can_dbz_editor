@@ -44,6 +44,54 @@ pub const SignalField = enum {
 };
 
 pub const NodeField = enum { name, description };
+pub const BusField = enum { name, nominal_bitrate, data_bitrate, protocol, description };
+pub const MetadataField = enum { document_name, description, dbc_version, extensions };
+
+pub const EnvironmentVariableField = enum {
+    name,
+    variable_type,
+    minimum,
+    maximum,
+    unit,
+    initial_value,
+    ev_id,
+    access_type,
+    access_nodes,
+    data_size,
+    description,
+};
+
+pub const AttributeDefinitionField = enum { name, scope, value_type, minimum, maximum, enum_labels, default };
+
+pub fn setMetadataField(doc: *model.Document, field: MetadataField, text_in: []const u8) Error!void {
+    const text = std.mem.trim(u8, text_in, " \t");
+    const a = doc.allocator();
+    switch (field) {
+        .document_name => doc.name = try optString(a, text),
+        .description => doc.description = try optString(a, text),
+        .dbc_version => {
+            var metadata: std.json.ObjectMap = if (doc.dbc) |value| if (value == .object) value.object else .empty else .empty;
+            if (text.len == 0) {
+                _ = metadata.orderedRemove("version");
+            } else {
+                try metadata.put(a, "version", .{ .string = try a.dupe(u8, text) });
+            }
+            doc.dbc = .{ .object = metadata };
+        },
+        .extensions => {
+            if (text.len == 0) {
+                doc.extensions = null;
+                return;
+            }
+            const value = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidValue,
+            };
+            if (value != .object) return error.InvalidValue;
+            doc.extensions = value;
+        },
+    }
+}
 
 pub fn addBus(doc: *model.Document, name_in: []const u8) Error!usize {
     const name = std.mem.trim(u8, name_in, " ");
@@ -54,6 +102,28 @@ pub fn addBus(doc: *model.Document, name_in: []const u8) Error!usize {
     const a = doc.allocator();
     try doc.buses.append(a, .{ .name = try a.dupe(u8, name) });
     return doc.buses.items.len - 1;
+}
+
+pub fn setBusField(doc: *model.Document, index: usize, field: BusField, text_in: []const u8) Error!void {
+    const text = std.mem.trim(u8, text_in, " \t");
+    const a = doc.allocator();
+    const bus = &doc.buses.items[index];
+    switch (field) {
+        .name => {
+            if (text.len == 0) return error.EmptyName;
+            if (!std.mem.eql(u8, text, bus.name) and findBus(doc, text) != null) return error.DuplicateName;
+            const old = bus.name;
+            const new = try a.dupe(u8, text);
+            bus.name = new;
+            for (doc.messages.items) |*message| {
+                if (std.mem.eql(u8, message.bus, old)) message.bus = new;
+            }
+        },
+        .nominal_bitrate => bus.nominal_bitrate = if (text.len == 0) null else std.fmt.parseInt(u32, text, 10) catch return error.InvalidNumber,
+        .data_bitrate => bus.data_bitrate = if (text.len == 0) null else std.fmt.parseInt(u32, text, 10) catch return error.InvalidNumber,
+        .protocol => bus.protocol = try optString(a, text),
+        .description => bus.description = try optString(a, text),
+    }
 }
 
 /// Appends a classic 8-byte message with the lowest free standard ID >= 0x100 on the bus.
@@ -417,10 +487,191 @@ pub fn addNode(doc: *model.Document, name_in: []const u8) Error!usize {
     return doc.nodes.items.len - 1;
 }
 
+pub fn findEnvironmentVariable(doc: *const model.Document, name: []const u8) ?usize {
+    for (doc.environment_variables.items, 0..) |variable, i| {
+        if (std.mem.eql(u8, variable.name, name)) return i;
+    }
+    return null;
+}
+
+pub fn addEnvironmentVariable(doc: *model.Document, name_in: []const u8) Error!usize {
+    const name = std.mem.trim(u8, name_in, " ");
+    if (name.len == 0) return error.EmptyName;
+    if (findEnvironmentVariable(doc, name) != null) return error.DuplicateName;
+    const a = doc.allocator();
+    try doc.environment_variables.append(a, .{
+        .name = try a.dupe(u8, name),
+        .variable_type = .integer,
+        .minimum = "0",
+        .maximum = "0",
+        .unit = "",
+        .initial_value = "0",
+        .ev_id = 0,
+        .access_type = 0,
+    });
+    return doc.environment_variables.items.len - 1;
+}
+
+pub fn deleteEnvironmentVariable(doc: *model.Document, index: usize) void {
+    _ = doc.environment_variables.orderedRemove(index);
+}
+
+pub fn setEnvironmentVariableField(doc: *model.Document, index: usize, field: EnvironmentVariableField, text_in: []const u8) Error!void {
+    const text = std.mem.trim(u8, text_in, " ");
+    const a = doc.allocator();
+    const variable = &doc.environment_variables.items[index];
+    switch (field) {
+        .name => {
+            if (text.len == 0) return error.EmptyName;
+            if (!std.mem.eql(u8, text, variable.name) and findEnvironmentVariable(doc, text) != null) return error.DuplicateName;
+            variable.name = try a.dupe(u8, text);
+        },
+        .variable_type => variable.variable_type = std.meta.stringToEnum(model.EnvironmentVariableType, text) orelse return error.InvalidValue,
+        .minimum => variable.minimum = try a.dupe(u8, text),
+        .maximum => variable.maximum = try a.dupe(u8, text),
+        .unit => variable.unit = try a.dupe(u8, text),
+        .initial_value => variable.initial_value = try a.dupe(u8, text),
+        .ev_id => variable.ev_id = std.fmt.parseInt(u32, text, 10) catch return error.InvalidNumber,
+        .access_type => variable.access_type = std.fmt.parseInt(u32, text, 10) catch return error.InvalidNumber,
+        .access_nodes => try setNodeList(doc, &variable.access_nodes, text),
+        .data_size => variable.data_size = if (text.len == 0) null else std.fmt.parseInt(u32, text, 10) catch return error.InvalidNumber,
+        .description => variable.description = try optString(a, text),
+    }
+}
+
+pub fn addAttributeDefinition(doc: *model.Document, name_in: []const u8) Error!usize {
+    const name = std.mem.trim(u8, name_in, " ");
+    if (name.len == 0) return error.EmptyName;
+    if (findAttributeDefinition(doc, name) != null) return error.DuplicateName;
+    try doc.attribute_definitions.append(doc.allocator(), .{
+        .name = try doc.allocator().dupe(u8, name),
+        .scope = .message,
+        .value_type = .string,
+    });
+    return doc.attribute_definitions.items.len - 1;
+}
+
+pub fn findAttributeDefinition(doc: *const model.Document, name: []const u8) ?usize {
+    for (doc.attribute_definitions.items, 0..) |definition, i| {
+        if (std.mem.eql(u8, definition.name, name)) return i;
+    }
+    return null;
+}
+
+pub fn setAttributeDefinitionField(doc: *model.Document, index: usize, field: AttributeDefinitionField, text_in: []const u8) Error!void {
+    const text = std.mem.trim(u8, text_in, " ");
+    const a = doc.allocator();
+    const definition = &doc.attribute_definitions.items[index];
+    switch (field) {
+        .name => {
+            if (text.len == 0) return error.EmptyName;
+            if (!std.mem.eql(u8, text, definition.name) and findAttributeDefinition(doc, text) != null) return error.DuplicateName;
+            const old = definition.name;
+            definition.name = try a.dupe(u8, text);
+            renameAssignmentName(&doc.attributes, old, definition.name);
+            for (doc.buses.items) |*bus| renameAssignmentName(&bus.attributes, old, definition.name);
+            for (doc.nodes.items) |*node| renameAssignmentName(&node.attributes, old, definition.name);
+            for (doc.environment_variables.items) |*variable| renameAssignmentName(&variable.attributes, old, definition.name);
+            for (doc.messages.items) |*message| {
+                renameAssignmentName(&message.attributes, old, definition.name);
+                for (message.signals.items) |*signal| renameAssignmentName(&signal.attributes, old, definition.name);
+            }
+        },
+        .scope => definition.scope = std.meta.stringToEnum(model.AttributeScope, text) orelse return error.InvalidValue,
+        .value_type => definition.value_type = std.meta.stringToEnum(model.AttributeType, text) orelse return error.InvalidValue,
+        .minimum => definition.minimum = try optString(a, text),
+        .maximum => definition.maximum = try optString(a, text),
+        .enum_labels => {
+            if (text.len == 0) {
+                definition.enum_labels = .empty;
+                return;
+            }
+            var labels: std.ArrayListUnmanaged([]const u8) = .empty;
+            var it = std.mem.splitScalar(u8, text, '|');
+            while (it.next()) |raw| {
+                const label = std.mem.trim(u8, raw, " ");
+                if (label.len == 0) return error.InvalidValue;
+                for (labels.items) |existing| {
+                    if (std.mem.eql(u8, existing, label)) return error.InvalidValue;
+                }
+                try labels.append(a, try a.dupe(u8, label));
+            }
+            definition.enum_labels = labels;
+        },
+        .default => definition.default = try parseAttributeValue(a, definition.value_type, text),
+    }
+}
+
+pub fn deleteAttributeDefinition(doc: *model.Document, index: usize) void {
+    const name = doc.attribute_definitions.items[index].name;
+    _ = doc.attribute_definitions.orderedRemove(index);
+    removeAssignmentName(&doc.attributes, name);
+    for (doc.buses.items) |*bus| removeAssignmentName(&bus.attributes, name);
+    for (doc.nodes.items) |*node| removeAssignmentName(&node.attributes, name);
+    for (doc.environment_variables.items) |*variable| removeAssignmentName(&variable.attributes, name);
+    for (doc.messages.items) |*message| {
+        removeAssignmentName(&message.attributes, name);
+        for (message.signals.items) |*signal| removeAssignmentName(&signal.attributes, name);
+    }
+}
+
+pub fn setAttributeAssignment(doc: *model.Document, assignments: *std.ArrayListUnmanaged(model.AttributeAssignment), definition_index: usize, text_in: []const u8) Error!void {
+    const text = std.mem.trim(u8, text_in, " ");
+    const definition = doc.attribute_definitions.items[definition_index];
+    for (assignments.items, 0..) |assignment, i| {
+        if (!std.mem.eql(u8, assignment.name, definition.name)) continue;
+        if (text.len == 0) {
+            _ = assignments.orderedRemove(i);
+            return;
+        }
+        assignments.items[i].value = (try parseAttributeValue(doc.allocator(), definition.value_type, text)) orelse return error.InvalidValue;
+        return;
+    }
+    if (text.len == 0) return;
+    const value = (try parseAttributeValue(doc.allocator(), definition.value_type, text)) orelse return error.InvalidValue;
+    try assignments.append(doc.allocator(), .{ .name = definition.name, .value = value });
+}
+
+fn parseAttributeValue(a: std.mem.Allocator, value_type: model.AttributeType, text: []const u8) Error!?model.AttributeValue {
+    if (text.len == 0) return null;
+    return switch (value_type) {
+        .integer => blk: {
+            _ = std.fmt.parseInt(i128, text, 10) catch return error.InvalidNumber;
+            break :blk .{ .integer = try a.dupe(u8, text) };
+        },
+        .hex => blk: {
+            const digits = if (std.mem.startsWith(u8, text, "0x") or std.mem.startsWith(u8, text, "0X")) text[2..] else text;
+            _ = std.fmt.parseInt(u64, digits, 16) catch return error.InvalidNumber;
+            break :blk .{ .hex = try a.dupe(u8, text) };
+        },
+        .float => blk: {
+            const number = std.fmt.parseFloat(f64, text) catch return error.InvalidNumber;
+            if (!std.math.isFinite(number)) return error.InvalidNumber;
+            break :blk .{ .float = try a.dupe(u8, text) };
+        },
+        .string => .{ .string = if (std.mem.eql(u8, text, "\"\"")) "" else try a.dupe(u8, text) },
+        .@"enum" => .{ .enum_index = std.fmt.parseInt(u32, text, 10) catch return error.InvalidNumber },
+    };
+}
+
+fn removeAssignmentName(assignments: *std.ArrayListUnmanaged(model.AttributeAssignment), name: []const u8) void {
+    var i: usize = 0;
+    while (i < assignments.items.len) {
+        if (std.mem.eql(u8, assignments.items[i].name, name)) _ = assignments.orderedRemove(i) else i += 1;
+    }
+}
+
+fn renameAssignmentName(assignments: *std.ArrayListUnmanaged(model.AttributeAssignment), old: []const u8, new: []const u8) void {
+    for (assignments.items) |*assignment| {
+        if (std.mem.eql(u8, assignment.name, old)) assignment.name = new;
+    }
+}
+
 /// Removes the node and every transmitter/receiver reference to it.
 pub fn deleteNode(doc: *model.Document, index: usize) void {
     const name = doc.nodes.items[index].name;
     _ = doc.nodes.orderedRemove(index);
+    for (doc.environment_variables.items) |*variable| removeName(&variable.access_nodes, name);
     for (doc.messages.items) |*m| {
         removeName(&m.transmitters, name);
         removeName(&m.receivers, name);
@@ -454,6 +705,7 @@ pub fn setNodeField(doc: *model.Document, index: usize, field: NodeField, text_i
             const old = node.name;
             const new = try a.dupe(u8, text);
             node.name = new;
+            for (doc.environment_variables.items) |*variable| renameIn(&variable.access_nodes, old, new);
             for (doc.messages.items) |*m| {
                 renameIn(&m.transmitters, old, new);
                 renameIn(&m.receivers, old, new);
@@ -562,6 +814,76 @@ test "add, edit and delete" {
     deleteSignal(&doc, m, s);
     deleteMessage(&doc, m);
     try std.testing.expectEqual(@as(usize, 0), doc.messages.items.len);
+}
+
+test "bus fields edit values and renaming follows message references" {
+    var doc = model.Document.init(std.testing.allocator);
+    defer doc.deinit();
+    const bus_index = try addBus(&doc, "can0");
+    const message_index = try addMessage(&doc, "can0", "Status");
+    try setBusField(&doc, bus_index, .nominal_bitrate, "500000");
+    try setBusField(&doc, bus_index, .data_bitrate, "2000000");
+    try setBusField(&doc, bus_index, .protocol, "CAN FD");
+    try setBusField(&doc, bus_index, .description, "Powertrain network");
+    try setBusField(&doc, bus_index, .name, "drive");
+    try std.testing.expectEqualStrings("drive", doc.messages.items[message_index].bus);
+    try std.testing.expectEqual(@as(?u32, 500000), doc.buses.items[bus_index].nominal_bitrate);
+    try std.testing.expectEqual(@as(?u32, 2000000), doc.buses.items[bus_index].data_bitrate);
+    try std.testing.expectEqualStrings("CAN FD", doc.buses.items[bus_index].protocol.?);
+    try std.testing.expectEqualStrings("Powertrain network", doc.buses.items[bus_index].description.?);
+    try std.testing.expectError(error.DuplicateName, addBus(&doc, "drive"));
+    try std.testing.expectError(error.InvalidNumber, setBusField(&doc, bus_index, .nominal_bitrate, "fast"));
+}
+
+test "environment variables can be added, edited and deleted" {
+    var doc = model.Document.init(std.testing.allocator);
+    defer doc.deinit();
+    const index = try addEnvironmentVariable(&doc, "Ambient");
+    try std.testing.expectError(error.DuplicateName, addEnvironmentVariable(&doc, "Ambient"));
+    try setEnvironmentVariableField(&doc, index, .variable_type, "data");
+    try setEnvironmentVariableField(&doc, index, .data_size, "16");
+    try setEnvironmentVariableField(&doc, index, .access_nodes, "ECU, Dashboard");
+    try setEnvironmentVariableField(&doc, index, .description, "raw payload");
+    try std.testing.expectEqual(model.EnvironmentVariableType.data, doc.environment_variables.items[index].variable_type);
+    try std.testing.expectEqual(@as(?u32, 16), doc.environment_variables.items[index].data_size);
+    try std.testing.expectEqual(@as(usize, 2), doc.environment_variables.items[index].access_nodes.items.len);
+    try std.testing.expectEqual(@as(usize, 2), doc.nodes.items.len);
+    try setNodeField(&doc, 0, .name, "ECU2");
+    try std.testing.expectEqualStrings("ECU2", doc.environment_variables.items[index].access_nodes.items[0]);
+    try std.testing.expectError(error.InvalidNumber, setEnvironmentVariableField(&doc, index, .ev_id, "nope"));
+    deleteNode(&doc, 0);
+    try std.testing.expectEqual(@as(usize, 1), doc.environment_variables.items[index].access_nodes.items.len);
+    deleteEnvironmentVariable(&doc, index);
+    try std.testing.expectEqual(@as(usize, 0), doc.environment_variables.items.len);
+}
+
+test "typed attribute definitions and assignments stay linked through rename and deletion" {
+    var doc = model.Document.init(std.testing.allocator);
+    defer doc.deinit();
+    const definition_index = try addAttributeDefinition(&doc, "Mode");
+    try setAttributeDefinitionField(&doc, definition_index, .scope, "document");
+    try setAttributeDefinitionField(&doc, definition_index, .value_type, "enum");
+    try setAttributeDefinitionField(&doc, definition_index, .enum_labels, "Off|On");
+    try setAttributeDefinitionField(&doc, definition_index, .default, "1");
+    try setAttributeAssignment(&doc, &doc.attributes, definition_index, "0");
+    try std.testing.expectEqual(@as(u32, 0), doc.attributes.items[0].value.enum_index);
+
+    try setAttributeDefinitionField(&doc, definition_index, .name, "RunMode");
+    try std.testing.expectEqualStrings("RunMode", doc.attributes.items[0].name);
+    deleteAttributeDefinition(&doc, definition_index);
+    try std.testing.expectEqual(@as(usize, 0), doc.attributes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), doc.attribute_definitions.items.len);
+}
+
+test "empty string attribute values have an explicit editor representation" {
+    var doc = model.Document.init(std.testing.allocator);
+    defer doc.deinit();
+    const definition_index = try addAttributeDefinition(&doc, "Label");
+    try setAttributeDefinitionField(&doc, definition_index, .value_type, "string");
+    try setAttributeAssignment(&doc, &doc.attributes, definition_index, "\"\"");
+    try std.testing.expectEqualStrings("", doc.attributes.items[0].value.string);
+    try setAttributeAssignment(&doc, &doc.attributes, definition_index, "");
+    try std.testing.expectEqual(@as(usize, 0), doc.attributes.items.len);
 }
 
 test "duplicating a signal and a message gives independent copies" {

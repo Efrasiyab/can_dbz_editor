@@ -31,10 +31,12 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const tests = b.addTest(.{ .root_module = root });
+    const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&b.addRunArtifact(tests).step);
+    test_step.dependOn(&run_tests.step);
 
-    // ZLS / build-on-save friendliness.
-    const check_step = b.step("check", "Build for ZLS / editor diagnostics");
+    const check_step = b.step("check", "Compile the app and unit tests");
     check_step.dependOn(&exe.step);
+    check_step.dependOn(&tests.step);
+    b.default_step.dependOn(check_step);
 }

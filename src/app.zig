@@ -167,9 +167,18 @@ pub const App = struct {
         try cio.exportDbc(self.gpa, self.io, &self.doc, path);
     }
 
+    pub fn exportDbcForBus(self: *App, bus_name: []const u8, path: []const u8) !void {
+        try cio.exportDbcForBus(self.gpa, self.io, &self.doc, bus_name, path);
+    }
+
     pub fn revalidate(self: *App) !void {
         self.validate_countdown = 0;
         try vd.validateAll(self.gpa, &self.doc, &self.diags);
+    }
+
+    pub fn revalidateDbcExport(self: *App, bus_name: []const u8) !void {
+        self.validate_countdown = 0;
+        try vd.validateDbcExport(self.gpa, &self.doc, &self.diags, bus_name);
     }
 
     /// Called on every UI tick; runs debounced validation.

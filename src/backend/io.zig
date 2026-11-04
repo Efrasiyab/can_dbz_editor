@@ -79,6 +79,12 @@ pub fn exportDbc(gpa: std.mem.Allocator, io: std.Io, doc: *const can_dbz.model.D
     try atomicWrite(gpa, io, path, bytes);
 }
 
+pub fn exportDbcForBus(gpa: std.mem.Allocator, io: std.Io, doc: *const can_dbz.model.Document, bus_name: []const u8, path: []const u8) !void {
+    const bytes = try can_dbz.formats.dbc.writeForBus(gpa, doc, bus_name);
+    defer gpa.free(bytes);
+    try atomicWrite(gpa, io, path, bytes);
+}
+
 /// Writes `path.tmp`, syncs, then renames over `path`.
 pub fn atomicWrite(gpa: std.mem.Allocator, io: std.Io, path: []const u8, data: []const u8) !void {
     const tmp = try std.fmt.allocPrint(gpa, "{s}.tmp", .{path});
